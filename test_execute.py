@@ -11,7 +11,7 @@ import unittest
 from urllib.parse import unquote
 
 from payload import chunk_path, publish
-from scheduler import DependencyScan
+from scheduler import collect_scans, DependencyScan
 
 EXECUTOR=Path(__file__).absolute().parent/'execute.py'
 SCHEDULER = Path(__file__).absolute().parent / 'scheduler.py'
@@ -104,13 +104,86 @@ class PayloadTest(unittest.TestCase):
 
 
 class CompilerDependenciesTest(unittest.TestCase):
+    def test_scan_reuses_declared_source_namespace_and_reports_used_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'prepared/include').mkdir(parents=True)
+            (root / 'prepared/main.c').write_text('source')
+            (root / 'prepared/include/chosen.h').write_text('prepared header')
+            (root / 'prepared/include/unused.h').write_text('unused')
+            (root / 'stage').mkdir()
+            (root / 'stage/generated.h').write_text('generated header')
+            program = '\n'.join([
+                'from pathlib import Path',
+                'import sys',
+                "assert Path('original/include/chosen.h').read_text() == 'prepared header'",
+                "assert Path('prepared/include/chosen.h').read_text() == 'prepared header'",
+                "assert Path('plan/headers/generated.h').read_text() == 'generated header'",
+                "assert Path('plan/headers/main.c').read_text() == 'source'",
+                "Path(sys.argv[sys.argv.index('-MF') + 1]).write_text('scan: original/main.c prepared/include/chosen.h plan/headers/generated.h\\n')",
+            ])
+            manifest = root / 'compile.json'
+            manifest.write_text(json.dumps(dict(
+                executable=sys.executable, arguments=['-c', program, 'scan'],
+                inputs=['prepared', 'plan/headers'], outputs=['plan/result'],
+                directory_inputs=['plan/headers'], directory_outputs=[], environment={},
+            )))
+            request = root / 'request.json'
+            request.write_text(json.dumps(dict(
+                manifest=str(manifest), source_prefix='prepared', original_prefix='original',
+                aliases={'prepared': 'prepared', 'original': 'prepared',
+                         'original/main.c': 'prepared/main.c',
+                         'plan/headers/main.c': 'prepared/main.c',
+                         'plan/generated.h': 'stage/generated.h',
+                         'plan/headers/generated.h': 'stage/generated.h'},
+                empty_directories=['plan/headers'],
+                scan=dict(argument_start=3, header_tree='plan/headers', generated={'generated.h': 'plan/generated.h', 'main.c': 'original/main.c'}, mandatory=['original/main.c']),
+            )))
+            result = subprocess.run(
+                [sys.executable, str(SCHEDULER), 'scan', str(request), 'outputs/dependencies.json', 'outputs/used-inputs'],
+                cwd=root, capture_output=True, text=True,
+                env=dict(os.environ, PYTHONPATH=str(SCHEDULER.parent)),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads((root / 'outputs/dependencies.json').read_text()), dict(
+                sources=['include/chosen.h', 'main.c'], generated=['generated.h', 'main.c'],
+            ))
+            self.assertEqual((root / 'outputs/used-inputs').read_text().splitlines(), [
+                'prepared/include/chosen.h', 'prepared/main.c', 'stage/generated.h',
+            ])
+
+    def test_collector_shares_names_and_preserves_each_job_and_full_report(self):
+        def decoded(directory):
+            chunks = sorted((p for p in directory.rglob('*') if '=' in p.name), key=lambda p: p.name)
+            return json.loads(unquote(''.join(p.name.split('=', 1)[1] for p in chunks)))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            names = [f'include/{index:04d}/' + 'long_native_header_name_' * 3 + '.h' for index in range(200)]
+            answers = {'2': dict(sources=names, generated=['include/generated/config.h']),
+                       '11': dict(sources=list(reversed(names)), generated=[names[0]])}
+            for identity, answer in answers.items():
+                directory = root / 'scans' / identity
+                directory.mkdir(parents=True)
+                (directory / 'dependencies.json').write_text(json.dumps(answer))
+                (directory / 'used-inputs').write_text('')
+            collect_scans(root / 'scans', root / 'metadata')
+            paths = decoded(root / 'metadata/paths')
+            self.assertEqual(len(paths), len(names) + 1)
+            for identity, expected in answers.items():
+                indices = decoded(root / 'metadata/jobs' / identity)
+                self.assertEqual({kind: [paths[index] for index in values] for kind, values in indices.items()}, expected)
+            self.assertEqual(json.loads((root / 'metadata/report.json').read_text()), answers)
+            self.assertGreater(len(list((root / 'metadata/paths').rglob('*=*'))), 100)
+
     def test_source_and_generated_dependencies_keep_distinct_names(self):
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
             scan = DependencyScan(dict(
                 source_prefix='prepared',
                 original_prefix='original',
-                aliases={'plan/generated.c': 'stage/artifacts/generated.c'},
+                aliases={'plan/generated.c': 'stage/artifacts/generated.c',
+                         'original/include/aliased.h': 'prepared/include/aliased.h'},
                 scan=dict(
                     argument_start=0,
                     header_tree='plan/headers',
@@ -119,6 +192,7 @@ class CompilerDependenciesTest(unittest.TestCase):
                         'generated.c': 'plan/generated.c',
                         'include/quoted name.h': 'plan/quoted.h',
                         'vmlinux.o': 'plan/vmlinux.o',
+                        '__source__/include/aliased.h': 'original/include/aliased.h',
                     },
                 ),
             ))
@@ -126,11 +200,11 @@ class CompilerDependenciesTest(unittest.TestCase):
             scan.depfile.write_text(
                 'object: original/source.c prepared/include/shared.h \\\n'
                 f' {work}/plan/headers/include/shared.h '
-                'stage/artifacts/generated.c include/quoted\\ name.h\n'
+                'stage/artifacts/generated.c include/quoted\\ name.h prepared/include/aliased.h\n'
             )
             self.assertEqual(scan.dependencies(work), dict(
-                sources=['include/shared.h', 'source.c'],
-                generated=['generated.c', 'include/quoted name.h', 'include/shared.h'],
+                sources=['include/aliased.h', 'include/shared.h', 'source.c'],
+                generated=['__source__/include/aliased.h', 'generated.c', 'include/quoted name.h', 'include/shared.h'],
             ))
 
     def test_undeclared_generated_header_is_rejected(self):
@@ -154,8 +228,8 @@ class CompilerDependenciesTest(unittest.TestCase):
             (root / 'generated.c').write_text('generated source')
             (root / 'initramfs').write_bytes(b'native payload')
             (root / 'tools.json').write_text('[]')
-            # Neither the scan's aggregate archive nor the unused vmlinux.o
-            # exists during execution. The original manifest still names both.
+            # The unused vmlinux.o does not exist during execution. There is no
+            # aggregate archive: the namespace is made from selected Files.
             manifest = root / 'compile.json'
             program = '\n'.join([
                 'from pathlib import Path',
@@ -172,9 +246,9 @@ class CompilerDependenciesTest(unittest.TestCase):
             manifest.write_text(json.dumps(dict(
                 executable=sys.executable,
                 arguments=['-c', program],
-                inputs=['plan/headers', 'plan/vmlinux.o', 'plan/generated.c'],
+                inputs=['plan/vmlinux.o', 'plan/generated.c'],
                 outputs=['plan/result'],
-                directory_inputs=['plan/headers'],
+                directory_inputs=[],
                 directory_outputs=[],
                 common_inputs='plan/tools.json',
                 environment={},
@@ -199,6 +273,54 @@ class CompilerDependenciesTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((root / 'result').read_bytes(), b'selected header:generated source:native payload')
+
+    def test_native_namespace_uses_scheduled_files_and_writable_private_copies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'scheduled-header').write_text('original header')
+            (root / 'scheduled-header').chmod(0o444)
+            (root / 'scheduled-payload').write_bytes(b'native payload')
+            manifest = root / 'native.json'
+            program = '\n'.join([
+                'from pathlib import Path',
+                'import shutil',
+                "assert Path('plan/headers/arch/x86').is_dir()",
+                "assert Path('plan/headers/include/header.h').is_symlink()",
+                "shutil.copytree('plan/headers', 'private-work', symlinks=False)",
+                "header = Path('private-work/include/header.h')",
+                "assert not header.is_symlink()",
+                "header.chmod(header.stat().st_mode | 0o200)",
+                "header.write_text('modified private header')",
+                "Path('plan/result').write_bytes(header.read_bytes() + b':' + Path('private-work/payload').read_bytes())",
+            ])
+            manifest.write_text(json.dumps(dict(
+                executable=sys.executable,
+                arguments=['-c', program],
+                inputs=['plan/header', 'plan/payload'],
+                aliases={'plan/headers/include/header.h': 'plan/header', 'plan/headers/payload': 'plan/payload'},
+                empty_directories=['plan/headers', 'plan/headers/arch/x86'],
+                outputs=['plan/result'],
+                directory_inputs=[],
+                directory_outputs=[],
+                environment={},
+            )))
+            mapping = root / 'mapping.json'
+            mapping.write_text(json.dumps(dict(
+                manifest=str(manifest),
+                aliases={'plan/header': 'scheduled-header', 'plan/payload': 'scheduled-payload'},
+                source_inputs=[],
+                outputs={'plan/result': 'result'},
+            )))
+            result = subprocess.run(
+                [sys.executable, str(SCHEDULER), 'execute', str(mapping)],
+                cwd=root, capture_output=True, text=True,
+                env=dict(os.environ, PYTHONPATH=str(SCHEDULER.parent)),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / 'result').read_bytes(), b'modified private header:native payload')
+            self.assertEqual((root / 'scheduled-header').read_text(), 'original header')
+            self.assertEqual((root / 'scheduled-header').stat().st_mode & 0o777, 0o444)
+            self.assertEqual((root / 'scheduled-payload').read_bytes(), b'native payload')
 
 
 if __name__=='__main__':unittest.main()

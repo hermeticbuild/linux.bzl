@@ -98,7 +98,7 @@ class ReuseTest(unittest.TestCase):
         ]
         actions, sets = [], []
         for index, (output, mnemonic, inputs) in enumerate(producers, 1):
-            actions.append({"mnemonic": mnemonic, "outputIds": [ids[output]], "inputDepSetIds": [str(index)]})
+            actions.append({"mnemonic": mnemonic, "outputIds": [ids[output]], "inputDepSetIds": [str(index)], "actionKey": output, "targetId": "kernel", "configurationId": "config"})
             sets.append({"id": str(index), "directArtifactIds": [ids[path] for path in inputs]})
         query = {
             "pathFragments": [{"id": identity, "label": name} for name, identity in ids.items()],
@@ -117,7 +117,86 @@ class ReuseTest(unittest.TestCase):
                 for phase, key in (("frontend", "frontend"), ("backend", "object"), ("integrated", "integrated"))
             ],
         }
+        graph = self.add_scan_graph(manifest)
         return graph, manifest
+
+    def add_scan_graph(self, manifest: dict) -> reuse_report.ActionGraph:
+        query = json.loads((self.directory / "query.json").read_text())
+        manifest["compiler_scans"] = []
+        helper_id = str(len(query["artifacts"]) + 1)
+        query["pathFragments"].append({"id": helper_id, "label": "helper.o"})
+        query["artifacts"].append({"id": helper_id, "pathFragmentId": helper_id})
+        query["actions"].append({"mnemonic": "KernelArtifact", "actionKey": "helper-compile", "outputIds": [helper_id], "targetId": "kernel", "configurationId": "config"})
+        jobs = [job for job in manifest["compiler_jobs"] if job["phase"] != "backend"] + [{"outputs": ["helper.o"]}]
+        for job in jobs:
+            phase = job.get("phase", "helper")
+            outputs = [f"scans/{phase}/dependencies.json", f"scans/{phase}/used-inputs"]
+            ids = []
+            for path in outputs:
+                identity = str(len(query["artifacts"]) + 1)
+                query["pathFragments"].append({"id": identity, "label": path})
+                query["artifacts"].append({"id": identity, "pathFragmentId": identity})
+                ids.append(identity)
+            query["actions"].append({"mnemonic": reuse_report.SCAN_MNEMONIC, "actionKey": "scan-" + phase, "outputIds": ids, "targetId": "kernel", "configurationId": "config"})
+            manifest["compiler_scans"].append({"compiler": {key: job[key] for key in ("phase", "target", "source", "kind")} if "phase" in job else {}, "compiler_outputs": job["outputs"], "outputs": outputs})
+        return reuse_report.ActionGraph.read(self.write("query.json", query))
+
+    def scan_records(self, name: str, targets: dict[str, dict[str, tuple[str, ...]]], entries: list[dict], executed: set[str], *, cached: bool = False) -> None:
+        scans = []
+        for target, roles in targets.items():
+            for role, outputs in roles.items():
+                if role == "backend":
+                    continue
+                scan_outputs = [f"scans/{target}/{role}/dependencies.json", f"scans/{target}/{role}/used-inputs"]
+                scans.append({"compiler": {"target": target, "phase": role, "kind": "assembly" if role == "single" else "c", "source": target + ".source"}, "compiler_outputs": [reuse_report.mapped(path) for path in outputs], "outputs": scan_outputs})
+                if target in executed:
+                    self.append_scan_spawn(entries, scan_outputs, cached=cached)
+        helper = {"compiler": {}, "compiler_outputs": ["helper.o"], "outputs": ["scans/helper/dependencies.json", "scans/helper/used-inputs"]}
+        scans.append(helper)
+        if "helper" in executed:
+            self.append_scan_spawn(entries, helper["outputs"], cached=cached)
+        self.write(f"{name}.scans.json", scans)
+
+    def append_scan_spawn(self, entries: list[dict], outputs: list[str], *, cached: bool = False) -> None:
+        first = max((entry.get("id", 0) for entry in entries), default=0) + 1
+        entries.extend({"id": first + index, "path": path} for index, path in enumerate(outputs))
+        entry = spawn(first, hit=cached)
+        entry["spawn"]["mnemonic"] = reuse_report.SCAN_MNEMONIC
+        entry["spawn"]["outputs"] = [{"outputId": first + index} for index in range(len(outputs))]
+        entries.append(entry)
+
+    def test_scanner_inventory_covers_reference_and_rejects_omissions(self) -> None:
+        graph, manifest = self.native_graph()
+        scans = reuse_report.authenticate_scans(manifest, graph, "manifest.json")
+        self.assertEqual({scan.compiler["phase"] if scan.compiler else "helper" for scan in scans.values()}, {"frontend", "integrated", "helper"})
+        for defect in ("missing_helper", "missing_reference", "duplicate", "wrong_compiler", "hidden_role", "wrong_producer", "unrecorded", "missing_owner"):
+            with self.subTest(defect=defect):
+                graph, altered = self.native_graph()
+                if defect == "missing_helper":
+                    altered["compiler_scans"].pop()
+                elif defect == "missing_reference":
+                    altered["compiler_scans"].pop(1)
+                elif defect == "duplicate":
+                    altered["compiler_scans"].append(altered["compiler_scans"][0])
+                elif defect == "wrong_compiler":
+                    altered["compiler_scans"][0]["compiler"]["source"] = "other.c"
+                elif defect == "hidden_role":
+                    altered["compiler_scans"][0]["compiler"] = {}
+                elif defect == "wrong_producer":
+                    graph.producer(altered["compiler_scans"][0]["outputs"][0])["mnemonic"] = "KernelDependencyMetadata"
+                elif defect == "missing_owner":
+                    del graph.producer("manifest.json")["configurationId"]
+                else:
+                    action = dict(graph.producer(altered["compiler_scans"][0]["outputs"][0]), outputIds=[graph.identities["other.c"]])
+                    graph.actions.append(action)
+                with self.assertRaises(ValueError):
+                    reuse_report.authenticate_scans(altered, graph, "manifest.json")
+        graph, manifest = self.native_graph()
+        # A global skyframe dump also has old configurations and abstract
+        # templates. Neither is an executed scanner in this kernel owner.
+        action = graph.producer(manifest["compiler_scans"][0]["outputs"][0])
+        graph.actions.extend([dict(action, configurationId="old", outputIds=[graph.identities["other.c"]]), {key: value for key, value in action.items() if key != "actionKey"}])
+        self.assertEqual(len(reuse_report.authenticate_scans(manifest, graph, "manifest.json")), 3)
 
     def test_actual_compiler_chain_and_explicit_roles(self) -> None:
         graph, manifest = self.native_graph()
@@ -309,6 +388,9 @@ class ReuseTest(unittest.TestCase):
             manifest[key]["lib/ctype.o"] = manifest[key].pop("unit.o")
         for job in manifest["compiler_jobs"]:
             job["target"] = "lib/ctype.o"
+        for scan in manifest["compiler_scans"]:
+            if scan["compiler"]:
+                scan["compiler"]["target"] = "lib/ctype.o"
         manifest["roots"] = ["lib/ctype.o"]
         self.write("manifest.json", manifest)
         (self.directory / "config").mkdir()
@@ -354,6 +436,8 @@ class ReuseTest(unittest.TestCase):
                     entries.append({"id": identity, "path": paths[role]})
                     entries.append(spawn(identity, backend=role == "object", hit=phase == "lz4", digest=role + content))
             self.write(f"{phase}.ir.json", snapshot)
+            scan_targets = {target: {"frontend": (value["paths"]["frontend"],), "integrated": (value["paths"]["integrated"],)} for target, value in snapshot.items()}
+            self.scan_records(phase, scan_targets, entries, set(selected) | {"helper"} if phase != "unchanged" else set(), cached=phase == "lz4")
             self.log(phase, entries)
             config = ["CONFIG_PANIC_TIMEOUT=" + ("37" if phase == "changed" else "0")]
             config += {
@@ -468,8 +552,46 @@ class ReuseTest(unittest.TestCase):
             entries = []
             for index, (target, role) in enumerate(selected, 1):
                 entries.extend([{"id": index, "path": roles[target][role][0]}, spawn(index, backend=role == "backend")])
+            scan_targets = {target: {role: paths for role, paths in outputs.items() if role != "backend"} for target, outputs in roles.items()}
+            for target in c_targets:
+                scan_targets[target]["integrated"] = (f"bazel-out/mapped/bin/integrated/{target}",)
+            self.scan_records(phase, scan_targets, entries, {target for target, _ in selected} | ({"helper"} if phase == "baseline" else set()))
             self.log(phase, entries)
         return roles
+
+    def test_scans_are_required_work_without_changing_compiler_denominator(self) -> None:
+        self.mutation()
+        result = reuse_report.report(self.directory)
+        self.assertEqual(result["compiler_phase_counts"], {"frontend": 6, "backend": 6, "single": 2})
+        self.assertEqual(result["scans"]["baseline"]["total_scanner_actions"], 15)
+        self.assertEqual(result["scans"]["baseline"]["roles"]["helper"]["executed"], 1)
+        for defect in ("missing_baseline", "missing_edited", "unrecorded", "unchanged_helper", "unrelated_helper", "generated_source"):
+            with self.subTest(defect=defect):
+                self.mutation()
+                phase = {"missing_baseline": "baseline", "missing_edited": "edited", "unchanged_helper": "unchanged", "generated_source": "incbin"}.get(defect, "header")
+                path = self.directory / f"{phase}.execution.jsonl"
+                entries = [json.loads(line) for line in path.read_text().splitlines()][1:]
+                scans = json.loads((self.directory / f"{phase}.scans.json").read_text())
+                if defect.startswith("missing_"):
+                    entries = [entry for entry in entries if entry.get("spawn", {}).get("mnemonic") != reuse_report.SCAN_MNEMONIC]
+                elif defect == "unrecorded":
+                    self.append_scan_spawn(entries, ["unrecorded/dependencies.json", "unrecorded/used-inputs"])
+                else:
+                    scan = next(scan for scan in scans if scan["compiler"].get("target") == ".vmlinux.export.o") if defect == "generated_source" else scans[-1]
+                    self.append_scan_spawn(entries, scan["outputs"])
+                self.log(phase, entries)
+                with self.assertRaises(ValueError):
+                    reuse_report.report(self.directory)
+
+    def test_family_unchanged_rejects_helper_scan_execution(self) -> None:
+        self.family()
+        path = self.directory / "unchanged.execution.jsonl"
+        entries = [json.loads(line) for line in path.read_text().splitlines()][1:]
+        scans = json.loads((self.directory / "unchanged.scans.json").read_text())
+        self.append_scan_spawn(entries, scans[-1]["outputs"])
+        self.log("unchanged", entries)
+        with self.assertRaisesRegex(ValueError, "Unchanged build executed compiler scans"):
+            ir_reuse_report.summarize(self.directory)
 
     def test_six_phase_selective_mutation_and_omissions(self) -> None:
         self.mutation()

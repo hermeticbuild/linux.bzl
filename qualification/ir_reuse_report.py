@@ -20,6 +20,9 @@ from qualification.reuse_report import (
     read_native_recipe_checks,
     records,
     snapshot_native_recipe_checks,
+    snapshot_scans,
+    scan_measurements,
+    scanner_report,
 )
 
 FAMILY = ("base", "debug", "btf", "lz4")
@@ -91,6 +94,7 @@ def snapshot(directory: Path, name: str, workspace: Path) -> None:
     graph = ActionGraph.read(query_path)
     manifest = read_manifest(directory, name, workspace, graph)
     reached, inventory = authenticate_compilers(manifest, graph)
+    snapshot_scans(directory, name, manifest, graph)
     snapshot_native_recipe_checks(directory, name, workspace, manifest, graph)
     report: dict[str, CompilerRecord] = {}
     for target, compiler in inventory.items():
@@ -266,6 +270,7 @@ def execution(path: Path, targets: dict[str, ArtifactRecord]) -> Execution:
 def summarize(directory: Path) -> None:
     names = FAMILY_PHASES
     native_recipes = {name: read_native_recipe_checks(directory, name) for name in names}
+    scan_inventories, scan_phases = scan_measurements(directory, names)
     snapshots = {name: read_snapshot(directory / f"{name}.ir.json") for name in names}
     expected = snapshots["base"].keys()
     assert expected and all(snapshots.values()), "Empty native compiler inventory"
@@ -301,6 +306,7 @@ def summarize(directory: Path) -> None:
     unchanged_digests = all(snapshots["base"][target]["digests"] == snapshots["unchanged"][target]["digests"] for target in expected)
     result = {
         "native_recipe_checks": native_recipes,
+        "scans": {name: scanner_report(scan_inventories[name], scan_phases[name]) for name in names},
         "phases": phases, "object_mismatches": parity, "equal_base_lz4_ir": equal,
         "lz4_backend_hits": hits, "panic_changed": changed,
         "paired_backend_actions": paired, "panic_action_changed": control_action_changed,

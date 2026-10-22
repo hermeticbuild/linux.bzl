@@ -1,5 +1,4 @@
 """Preprocess compiler dependencies, execute narrow-input jobs, and export results."""
-import concurrent.futures
 import json
 import os
 from pathlib import Path
@@ -73,7 +72,8 @@ class DependencyScan:
                 continue
             if path in generated_paths:
                 generated_names.update(generated_paths[path])
-                continue
+                # A source File can also back a generated-tree alias. Keep
+                # its measured source spelling for the compiler's -I paths.
             # The native wrapper also copies the header tree into its working
             # directory. Quoted includes can therefore use its logical names.
             if path in generated:
@@ -90,20 +90,55 @@ class DependencyScan:
         return dict(sources=sorted(source_names), generated=sorted(generated_names))
 
 
-def scan(request):
+def scan(request, dependencies: Path, used_inputs: Path) -> None:
     spec = json.loads(Path(request['manifest']).read_text())
     spec['aliases'] = dict(request['aliases'])
-    spec['aliases'][request['original_prefix']] = request['source_prefix']
-    spec['inputs'] = spec['inputs'] + [request['original_prefix']]
-    return request['id'], execute(spec, DependencyScan(request))
+    spec['inputs'] = list(request['aliases'])
+    spec['empty_directories'] = request['empty_directories']
+    spec['directory_inputs'] = [name for name in spec['directory_inputs'] if name not in request['empty_directories']]
+    answer = execute(spec, DependencyScan(request))
+    selected = {request['source_prefix'] + '/' + name for name in answer['sources']}
+    generated = request['scan'].get('generated', {})
+    selected.update(request['aliases'][generated[name]] for name in answer['generated'])
+    dependencies.parent.mkdir(parents=True, exist_ok=True)
+    dependencies.write_text(json.dumps(answer, separators=(',', ':')) + '\n')
+    used_inputs.write_text(''.join(path + '\n' for path in sorted(selected)))
+
+
+def collect_scans(source: Path, output: Path) -> None:
+    """Keep audit answers intact and share logical names in callback metadata."""
+    answers: dict[str, CompilerDependencies] = {}
+    paths: dict[str, int] = {}
+    for path in sorted(source.glob('*/dependencies.json')):
+        identity = path.parent.name
+        if not identity.isdecimal() or not (path.parent / 'used-inputs').is_file():
+            raise ValueError('Invalid dependency scan outputs: ' + str(path))
+        match json.loads(path.read_text()):
+            case {'sources': list(sources), 'generated': list(generated)} as answer if len(answer) == 2:
+                if not all(isinstance(name, str) for name in sources + generated):
+                    raise ValueError('Invalid dependency scan names: ' + str(path))
+            case _:
+                raise ValueError('Invalid dependency scan result: ' + str(path))
+        answers[identity] = answer
+        indexed = {}
+        for kind, names in answer.items():
+            indices = []
+            for name in names:
+                indices.append(paths.setdefault(name, len(paths)))
+            indexed[kind] = indices
+        publish(output / 'jobs' / identity, indexed)
+    publish(output / 'paths', list(paths))
+    (output / 'report.json').write_text(json.dumps(answers, indent=2) + '\n')
 
 
 def run_job(mapping):
     spec = json.loads(Path(mapping['manifest']).read_text())
-    spec['aliases'] = mapping['aliases']
-    spec['inputs'] = list(mapping['aliases']) + mapping['source_inputs']
+    aliases = dict(mapping['aliases'])
+    aliases.update({name: mapping['aliases'][path] for name, path in spec.get('aliases', {}).items()})
+    spec['aliases'] = aliases
+    spec['inputs'] = list(aliases) + mapping['source_inputs']
     spec['output_aliases'] = mapping['outputs']
-    spec['empty_directories'] = mapping.get('empty_directories', [])
+    spec['empty_directories'] = spec.get('empty_directories', []) + mapping.get('empty_directories', [])
     execute(spec)
 
 
@@ -136,15 +171,15 @@ def export_manifest(source: Path, mappings: Path, output: Path) -> None:
         dict(job["compiler"], source=artifact(job["compiler"]["source"]), outputs=[artifact(path) for path in job["outputs"]])
         for job in scheduled["compiler_jobs"]
     ]
+    manifest["compiler_scans"] = scheduled["compiler_scans"]
     output.write_text(json.dumps(manifest, indent=2) + "\n")
 
 
 def main(arguments):
     if arguments[0] == 'scan':
-        requests = json.loads(Path(arguments[1]).read_text())
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            answers = dict(pool.map(scan, requests))
-        publish(arguments[2], answers)
+        scan(json.loads(Path(arguments[1]).read_text()), Path(arguments[2]), Path(arguments[3]))
+    elif arguments[0] == 'collect-scans':
+        collect_scans(Path(arguments[1]), Path(arguments[2]))
     elif arguments[0] == 'execute':
         run_job(json.loads(Path(arguments[1]).read_text()))
     elif arguments[0] == 'manifest':

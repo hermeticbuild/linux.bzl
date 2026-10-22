@@ -226,18 +226,30 @@ def native_argument(flag, anchors):
         parts = bound
     return {"parts": parts} if any([type(part) != "string" for part in parts]) else flag
 
+def header_namespace(ctx, path):
+    """Anchor compiler paths without copying the transitive native closure."""
+    anchor = ctx.actions.declare_file(path + "/.kbuild-directory")
+    ctx.actions.write(anchor, "")
+    return struct(path = anchor.dirname, anchor = anchor)
+
+def _header_aliases(tree, dependencies):
+    aliases = {}
+    for logical, file in dependencies.items():
+        if not logical or logical == "." or logical.startswith("/") or ".." in logical.split("/"):
+            fail("Generated input escapes its header namespace: " + logical)
+        aliases[tree.path + "/" + logical] = file
+    return aliases
+
 def compile_action(ctx, target, phase, source_file, output, flags, tree, dependencies, files, setup, source_kind, mandatory):
     execution = execution_tools(ctx)
     arguments = flags + (["-c"] if not any([flag in flags for flag in ["-S", "-E"]]) else []) + [source_file.path, "-o", output.path]
 
-    # Native inline assembly consumes build-root-relative .incbin paths. The
-    # integrated and frontend invocations share this exact working namespace.
+    # The scheduler constructs this header namespace in execute.py's private
+    # working directory. Keep native build-root-relative .incbin paths there;
+    # the executor owns its lifetime and the compiler only reads its aliases.
     command = """set -eu
 exec_root="$PWD"
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-cp -a %s/. "$work/"
-cd "$work"
+cd %s
 %s
 %s "$@"
 """ % (shell_quote(tree.path), _stage_links(files.to_list() + setup.files.to_list()), '"$exec_root/"' + shell_quote(setup.tools["CC"]))
@@ -247,7 +259,7 @@ cd "$work"
         execution,
         command = command,
         arguments = arguments,
-        inputs = depset([tree, source_file] + dependencies.values(), transitive = [files, setup.files]),
+        inputs = depset([source_file] + dependencies.values(), transitive = [files, setup.files]),
         outputs = [output],
         mnemonic = "KbuildCC",
         progress_message = "%s compile %s" % (phase, target),
@@ -317,7 +329,7 @@ def postprocess_commands(setup, target, variables, commands, dependencies, envir
     ])
     return struct(commands = expanded, sources = command_sources, object_only = object_only)
 
-def _postprocess(ctx, target, raw, output, source_file, post, dependencies, tree, files, source, setup):
+def postprocess(ctx, target, raw, output, source_file, post, dependencies, tree, files, source, setup):
     if post == None:
         # Keep the backend output path stable when configuration disables its
         # native tail, without staging the unused source/header namespace.
@@ -325,8 +337,8 @@ def _postprocess(ctx, target, raw, output, source_file, post, dependencies, tree
         return
     support = depset(transitive = [files, setup.files])
     if post.object_only:
-        # Keep every native prerequisite, header, and tool. Only the aggregate
-        # source tree is unnecessary for the verified object-tool invocation.
+        # Keep every native prerequisite and tool. The verified object-tool
+        # invocation needs neither aggregate source nor header staging.
         support = depset([file for file in support.to_list() if file.path != source])
     recipe_files = []
     command = native_recipe(ctx, target, [{"command": "\n".join(post.commands), "strict": True, "ignore_errors": False}], post.sources, setup, recipe_files, [("__source__", source), ("__object__", ".")])
@@ -335,7 +347,7 @@ def _postprocess(ctx, target, raw, output, source_file, post, dependencies, tree
 exec_root="$PWD"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-cp -a %s/. "$work/"
+%s
 cd "$work"
 %s
 mkdir -p %s
@@ -343,8 +355,8 @@ cp "$exec_root"/%s %s
 chmod u+w %s
 %s
 cp %s "$exec_root"/%s
-""" % (shell_quote(tree.path), _stage_links([raw, source_file] + recipe_files + support.to_list()), shell_quote(target.rpartition("/")[0] or "."), shell_quote(raw.path), shell_quote(target), shell_quote(target), command, shell_quote(target), shell_quote(output.path))
-    run_recipe(ctx, execution_tools(ctx), command = script, inputs = depset([tree, raw, source_file] + dependencies.values() + recipe_files, transitive = [support]), outputs = [output], mnemonic = "KbuildPostprocess", progress_message = "Postprocess " + target)
+""" % ("" if post.object_only else 'cp -R -L -p %s/. "$work/"\nchmod -R u+w "$work"' % shell_quote(tree.path), _stage_links([raw, source_file] + recipe_files + support.to_list()), shell_quote(target.rpartition("/")[0] or "."), shell_quote(raw.path), shell_quote(target), shell_quote(target), command, shell_quote(target), shell_quote(output.path))
+    run_recipe(ctx, execution_tools(ctx), command = script, inputs = depset([raw, source_file] + dependencies.values() + recipe_files, transitive = [support]), input_aliases = {} if post.object_only else _header_aliases(tree, dependencies), empty_directories = [] if post.object_only else [tree.path], outputs = [output], mnemonic = "KbuildPostprocess", progress_message = "Postprocess " + target)
 
 def _ir_diagnostics(ctx, flags, tree, dependencies, files, setup):
     execution = execution_tools(ctx)
@@ -371,7 +383,9 @@ def _ir_diagnostics(ctx, flags, tree, dependencies, files, setup):
     ctx.actions.run(
         executable = execution.python,
         arguments = ["-B", ctx.file._diagnostic_driver.path, spec.path, report.path],
-        inputs = depset([spec, ctx.file._diagnostic_driver, ctx.file._diagnostic_source, tree] + dependencies.values(), transitive = [files, setup.files]),
+        inputs = depset([spec, ctx.file._diagnostic_driver, ctx.file._diagnostic_source] + dependencies.values(), transitive = [files, setup.files]),
+        input_aliases = _header_aliases(tree, dependencies),
+        empty_directories = [tree.path],
         outputs = [report] + bitcodes,
         mnemonic = "KernelIRDiagnostics",
     )
@@ -386,10 +400,7 @@ def _compile_target(ctx, target, directory, outputs, dependencies, files, source
     source_file = dependencies.get(path, dependencies.get("__source__/" + path, original_sources.get(path)))
     if source_file == None:
         fail("No declared compiler source %s for %s" % (path, target))
-    tree = ctx.actions.declare_directory("kernel.headers/" + target)
-    mapping = ctx.actions.declare_file("kernel.header-inputs/" + target + ".json")
-    ctx.actions.write(mapping, json.encode({p: f.path for p, f in dependencies.items()}))
-    ctx.actions.run(executable = execution_tools(ctx).python, arguments = [ctx.file._materialize.path, mapping.path, tree.path, directory], inputs = depset([ctx.file._materialize, mapping] + dependencies.values(), transitive = [execution_tools(ctx).files]), outputs = [tree], mnemonic = "KbuildHeaders")
+    tree = header_namespace(ctx, "kernel.headers/" + target)
     variables = command_scope(setup, directory, target, "__object__", source, ancestry, graph_variables, native, invocation_environment)
     compile_variables = program(setup.program["image_command_helpers"], variables, setup.sources, cells = True).variables
     compile_variables.update(variables)
@@ -427,7 +438,7 @@ def _compile_target(ctx, target, directory, outputs, dependencies, files, source
         # header/config inputs to the backend. Only actual native prerequisites
         # and the selected compiler closure belong to that spawn.
         anchors = {
-            tree.path: {"file": tree.path, "parent": 0},
+            tree.path: {"file": tree.anchor.path, "parent": 1},
             source: {"file": source, "parent": 0},
         }
         for file in execution_tools(ctx).target_compiler_files.to_list():
@@ -469,7 +480,7 @@ def _compile_target(ctx, target, directory, outputs, dependencies, files, source
     else:
         compile_action(ctx, target, "single", source_file, raw, flags, tree, dependencies, files, setup, source_kind, mandatory)
     if raw != outputs[target]:
-        _postprocess(ctx, target, raw, outputs[target], source_file, post, dependencies, tree, files, source, setup)
+        postprocess(ctx, target, raw, outputs[target], source_file, post, dependencies, tree, files, source, setup)
     return result
 
 # These helpers register actions through the callback adapter, rather than BUILD macros.
@@ -501,10 +512,7 @@ def register(ctx, target, directory, kind, driver, outputs, dependencies, files,
         return _compile_target(ctx, target, directory, outputs, dependencies, files, source, config, setup, native, ancestry, graph_variables, original_sources, compiler_prerequisites, postprocess_dependencies, invocation_environment, compiler_kind)
 
     if kind == "host":
-        tree = ctx.actions.declare_directory("kernel.host-headers/" + target)
-        mapping = ctx.actions.declare_file("kernel.host-inputs/" + target + ".json")
-        ctx.actions.write(mapping, json.encode({p: f.path for p, f in dependencies.items()}))
-        ctx.actions.run(executable = execution_tools(ctx).python, arguments = [ctx.file._materialize.path, mapping.path, tree.path, directory], inputs = depset([ctx.file._materialize, mapping] + dependencies.values(), transitive = [execution_tools(ctx).files]), outputs = [tree], mnemonic = "KbuildHeaders")
+        tree = header_namespace(ctx, "kernel.host-headers/" + target)
         variables = command_scope(setup, directory, target, "__object__", source, ancestry, graph_variables, native, invocation_environment)
         link = not target.endswith(".o")
         path = target[:-2] + ".c" if target.endswith(".o") else target + ".c"
@@ -517,13 +525,13 @@ def register(ctx, target, directory, kind, driver, outputs, dependencies, files,
             obj = ctx.actions.declare_file("kernel.host-objects/" + target + ".o") if link else outputs[target]
             flags = _rewrite_flags(_host_flags(setup, False) + shell_words(value("hostc_flags", variables, setup.sources)), tree.path, source, dependencies)
             flags += ["-c", source_file.path, "-o", obj.path]
-            ctx.actions.run(executable = setup.tools["HOSTCC"], arguments = flags, env = execution_tools(ctx).host_compile_env, inputs = depset([tree, source_file] + dependencies.values(), transitive = [files, setup.files]), outputs = [obj], mnemonic = "KbuildHostCC", progress_message = "Compile host " + target, compiler = dict(phase = "single", target = target, source = source_file.path, kind = "host", executable = setup.tools["HOSTCC"], arguments = flags, environment = execution_tools(ctx).host_compile_env), scan = dict(argument_start = 0, header_tree = tree.path, generated = {p: f.path for p, f in dependencies.items()}, mandatory = [source_file.path] + [file.path for file in compiler_prerequisites.values()], directories = [directory]))
+            ctx.actions.run(executable = setup.tools["HOSTCC"], arguments = flags, env = execution_tools(ctx).host_compile_env, inputs = depset([source_file] + dependencies.values(), transitive = [files, setup.files]), outputs = [obj], mnemonic = "KbuildHostCC", progress_message = "Compile host " + target, compiler = dict(phase = "single", target = target, source = source_file.path, kind = "host", executable = setup.tools["HOSTCC"], arguments = flags, environment = execution_tools(ctx).host_compile_env), scan = dict(argument_start = 0, header_tree = tree.path, generated = {p: f.path for p, f in dependencies.items()}, mandatory = [source_file.path] + [file.path for file in compiler_prerequisites.values()], directories = [directory]))
             objects.append(obj)
             result = dict(kind = "host", source = source_file.path, object = obj.path, flags = flags)
         if link:
             flags = _host_flags(setup, True) + shell_words(value("KBUILD_HOSTLDFLAGS", variables, setup.sources)) + [obj.path for obj in objects] + shell_words(value("KBUILD_HOSTLDLIBS", variables, setup.sources))
             flags = _rewrite_flags(flags, tree.path, source, dependencies) + ["-o", outputs[target].path]
-            ctx.actions.run(executable = setup.tools["HOSTCC"], arguments = flags, env = execution_tools(ctx).host_link_env, inputs = depset(objects + dependencies.values(), transitive = [files, setup.files]), outputs = outputs.values(), mnemonic = "KbuildHostLink", progress_message = "Link host " + target)
+            ctx.actions.run(executable = setup.tools["HOSTCC"], arguments = flags, env = execution_tools(ctx).host_link_env, inputs = depset(objects + dependencies.values(), transitive = [files, setup.files]), input_aliases = _header_aliases(tree, dependencies), empty_directories = [tree.path], outputs = outputs.values(), mnemonic = "KbuildHostLink", progress_message = "Link host " + target)
         return result
     if driver == "asm_headers":
         ctx.actions.write(outputs[target], "#include <asm-generic/%s>\n" % target.rsplit("/", 1)[-1])

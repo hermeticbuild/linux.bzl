@@ -9,9 +9,10 @@ second Kconfig solver or declared compiler-capability table.
 One generic Make/Python exporter, built with Bazel and pinned by host artifact
 integrity, exports source-only Kbuild syntax at repository time. Execution-time
 callbacks measure native compiler and host-library queries and register separate
-compiler, generator, archive, and linker actions. Dependency scans select the
-source and generated header inputs for each compiler action. Target product
-actions do not run Make. The BTF resolver uses a host libbpf archive and installed
+compiler, generator, archive, and linker actions. Each dependency scan is a
+separate compiler action with declared candidate source and generated Files.
+Its measured reads select the inputs for both scan reuse and compilation.
+Target product actions do not run Make. The BTF resolver uses a host libbpf archive and installed
 headers built together by its selected kernel source's native Make rules.
 
 ## Consumer interface
@@ -66,15 +67,11 @@ still regenerates that header from its unchanged template and runs its own check
 Use Bazelisk with the version in [`.bazelversion`](.bazelversion) and the registered
 Linux execution toolchain. The temporary
 [Bazel fork](https://github.com/tamird/bazel/releases/tag/10.0.0-bb0242a676)
-provides native literal writes for action templates and includes their
-expanded children in action graph exports.
-Concrete child producers are required to qualify native compiler ancestry.
-Qualification captures them inside the measured build, before a later command
-can invalidate retained analysis state. This capture disables Skymeld and omits
-command text; producer ancestry uses declared edges and actual cache identity
-comes from the compact execution log.
-The release includes source, binary hashes, and native Linux and macOS
-test provenance for x86-64 and ARM64.
+provides input discovery and native literal writes for execution-time action
+templates and includes their expanded child actions in action graph exports.
+These interfaces support per-object preprocessing reuse, metadata generation,
+and their qualification. The release includes source,
+binary hashes, and native Linux and macOS test provenance for x86-64 and ARM64.
 The fork also repairs modified inputs during in-memory sandbox reuse. Input discovery guards already evaluated inputs, including
 cache-restored inputs, together with scheduling dependencies. Newly discovered
 inputs are evaluated before execution guards them, so pruned runfiles do not
@@ -128,7 +125,25 @@ first invocation's compiler observations, which a repeated local cache hit may
 omit from its execution log. Both retain actual execution logs and producer
 dependencies. The qualification reporters authenticate native
 compiler inventory, split C object ancestry, integrated reference parity, and
-cross-configuration backend action identity. Reference objects are enabled by
+cross-configuration backend action identity. They also authenticate every
+preprocessing scan, including host helpers and integrated references, against
+the expanded action graph and compact execution log. Unchanged builds must
+execute no scans; source and header mutations must execute the affected scans
+without repeating unrelated preprocessing. These scan counts are retained
+alongside the native compiler-role denominator and backend reuse checks.
+
+Earlier batched-scan reports omitted preprocessing from their compiler-work
+accounting. Backend cache-hit evidence from those reports remains specific to
+backend actions; it does not establish total compiler-work isolation. The
+current qualification captures expanded child actions inside the measured build
+with `--experimental_aquery_dump_after_build_format=jsonproto`, before a later
+command can invalidate retained analysis state. This capture disables Skymeld.
+It includes original discovery inputs and omits command text: producer ownership
+and compiler ancestry use the declared action edges, while scan work and backend
+cache identity come from the compact execution log. It does not establish each
+scanner's used-input set.
+
+Reference objects are enabled by
 `--//:validate_native_objects`, which also records the source-selected LZ4 and
 Make recipe-ordering checks and the two deferred compiler diagnostic controls.
 The manual `native_compiler_checks` and `native_compiler_checks_5_10` targets

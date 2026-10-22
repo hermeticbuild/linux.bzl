@@ -37,6 +37,8 @@ class Action(TypedDict):
     outputIds: list[QueryId]
     inputDepSetIds: NotRequired[list[QueryId]]
     targetId: NotRequired[QueryId]
+    configurationId: NotRequired[QueryId]
+    actionKey: NotRequired[str]
 
 
 class InputSet(TypedDict):
@@ -69,11 +71,20 @@ class CompilerDescriptor(TypedDict):
     source_file: str
 
 
-class CompilerJob(TypedDict):
+class CompilerIdentity(TypedDict):
     phase: str
     target: str
     source: str
     kind: str
+
+
+class CompilerJob(CompilerIdentity):
+    outputs: list[str]
+
+
+class CompilerScan(TypedDict):
+    compiler: dict[str, str]
+    compiler_outputs: list[str]
     outputs: list[str]
 
 
@@ -106,6 +117,7 @@ class KernelManifest(TypedDict):
     config_owner: str
     compiler_inventory: dict[str, CompilerDescriptor]
     compiler_jobs: list[CompilerJob]
+    compiler_scans: list[CompilerScan]
     compiler_diagnostics: NotRequired[list[str]]
     compiler_diagnostic_cases: NotRequired[dict[str, str]]
     native_recipe_checks: NotRequired[NativeRecipeArtifacts]
@@ -118,6 +130,7 @@ GZIP_PAYLOAD = "arch/x86/boot/compressed/vmlinux.bin.gz"
 BOOT_HEADERS = ("arch/x86/boot/voffset.h", "arch/x86/boot/zoffset.h")
 HEADER_TARGETS = ("init/do_mounts.o", "init/do_mounts_initrd.o", "init/initramfs.o", "init/do_mounts_rd.o")
 COMPILER_MNEMONICS = {"KernelArtifact", "KernelLLVMBackend"}
+SCAN_MNEMONIC = "KernelDependencyScan"
 NATIVE_RECIPE_FILES = {"report": "report.json", "compressed": "compressed.lz4", "expanded": "expanded.txt", "restored": "restored.bin"}
 NATIVE_RECIPE_EXPANDED = "quoted value|no|$literal"
 
@@ -520,10 +533,116 @@ def authenticate_compilers(manifest: KernelManifest, graph: ActionGraph) -> tupl
     return reached, inventory
 
 
+@dataclass
+class Scan:
+    compiler: CompilerIdentity | None
+    compiler_outputs: Outputs
+    outputs: Outputs
+
+    def record(self) -> CompilerScan:
+        return {"compiler": dict(self.compiler or {}), "compiler_outputs": list(self.compiler_outputs), "outputs": list(self.outputs)}
+
+
+def scan_inventory(value: object) -> dict[Outputs, Scan]:
+    """Validate scanner records independently of the native compiler denominator."""
+    if not isinstance(value, list) or not value:
+        raise ValueError("Missing compiler scan inventory")
+    result: dict[Outputs, Scan] = {}
+    compiler_outputs: set[str] = set()
+    scan_outputs: set[str] = set()
+    for record in value:
+        match record:
+            case {"compiler": dict(compiler), "compiler_outputs": list(outputs), "outputs": list(scanned)} if outputs and len(scanned) == 2 and all(isinstance(path, str) and path for path in outputs + scanned):
+                pass
+            case _:
+                raise ValueError(f"Invalid compiler scan record: {record}")
+        identity: CompilerIdentity | None = None
+        if compiler:
+            match compiler:
+                case {"phase": str(phase), "target": str(target), "source": str(source), "kind": str(kind)} if phase in ("frontend", "single", "integrated") and kind in ("c", "assembly", "host", "codegen"):
+                    identity = CompilerIdentity(phase=phase, target=target, source=source, kind=kind)
+                case _:
+                    raise ValueError(f"Invalid scanner compiler identity: {compiler}")
+            if set(compiler) != set(identity):
+                raise ValueError(f"Unexpected scanner compiler identity fields: {compiler}")
+        if len(set(outputs)) != len(outputs) or len(set(scanned)) != 2 or compiler_outputs.intersection(outputs) or scan_outputs.intersection(scanned):
+            raise ValueError(f"Duplicate compiler scan ownership: {record}")
+        compiler_outputs.update(outputs)
+        scan_outputs.update(scanned)
+        key = tuple(sorted(scanned))
+        result[key] = Scan(identity, tuple(sorted(outputs)), key)
+    if compiler_outputs.intersection(scan_outputs):
+        raise ValueError("Scanner outputs overlap compiler outputs")
+    return result
+
+
+def authenticate_scans(manifest: KernelManifest, graph: ActionGraph, manifest_path: str) -> dict[Outputs, Scan]:
+    """Cover all concrete scanners owned by this configured kernel, including helpers."""
+    scans = scan_inventory(manifest.get("compiler_scans"))
+    owner = graph.producer(manifest_path)
+    if "targetId" not in owner or "configurationId" not in owner:
+        raise ValueError("Kernel manifest producer has no configured owner")
+    scope = str(owner["targetId"]), str(owner["configurationId"])
+
+    def selected(action: Action) -> bool:
+        return (str(action.get("targetId")), str(action.get("configurationId"))) == scope
+
+    actual = {
+        tuple(sorted(graph.artifacts[str(output)] for output in action["outputIds"]))
+        for action in graph.actions
+        if action["mnemonic"] == SCAN_MNEMONIC and action.get("actionKey") and selected(action)
+    }
+    if actual != scans.keys():
+        raise ValueError(f"Compiler scan inventory differs from actual producers: unrecorded={actual - scans.keys()}, missing={scans.keys() - actual}")
+    jobs = {
+        tuple(sorted(job["outputs"])): CompilerIdentity(**{key: job[key] for key in ("phase", "target", "source", "kind")})
+        for job in manifest["compiler_jobs"]
+        if job["phase"] != "backend"
+    }
+    recorded_jobs = set()
+    for scan in scans.values():
+        producer = graph.producer(scan.compiler_outputs[0])
+        if producer["mnemonic"] != "KernelArtifact" or not producer.get("actionKey") or not selected(producer):
+            raise ValueError(f"Scanner has no corresponding native compiler producer: {scan.record()}")
+        if {graph.artifacts[str(output)] for output in producer["outputIds"]} != set(scan.compiler_outputs):
+            raise ValueError(f"Scanner compiler outputs differ from actual producer: {scan.record()}")
+        if scan.compiler is None:
+            if scan.compiler_outputs in jobs:
+                raise ValueError("A native compiler scan was relabeled as a helper")
+        elif jobs.get(scan.compiler_outputs) != scan.compiler:
+            raise ValueError(f"Scanner identity differs from scheduled native compiler: {scan.record()}")
+        else:
+            recorded_jobs.add(scan.compiler_outputs)
+    if recorded_jobs != jobs.keys():
+        raise ValueError(f"Missing scanner for native compiler roles: {jobs.keys() - recorded_jobs}")
+    return scans
+
+
+def snapshot_scans(directory: Path, name: str, manifest: KernelManifest, graph: ActionGraph) -> None:
+    match (directory / f"{name}.manifest-path").read_text().splitlines():
+        case [manifest_path] if manifest_path:
+            pass
+        case other:
+            raise ValueError(f"Expected one declared kernel manifest, found {other}")
+    scans = authenticate_scans(manifest, graph, manifest_path)
+    values = []
+    for scan in scans.values():
+        record = scan.record()
+        record["outputs"] = [mapped(path) for path in record["outputs"]]
+        record["compiler_outputs"] = [mapped(path) for path in record["compiler_outputs"]]
+        if record["compiler"]:
+            record["compiler"]["source"] = mapped(record["compiler"]["source"])
+        values.append(record)
+    # Mapping may not collapse two independently owned outputs.
+    scan_inventory(values)
+    (directory / f"{name}.scans.json").write_text(json.dumps(values, indent=2) + "\n")
+
+
 def snapshot(directory: Path, name: str, workspace: Path) -> None:
     graph = ActionGraph.read(directory / f"{name}.aquery.json")
     manifest = read_manifest(directory, name, workspace, graph)
     _, compilers = authenticate_compilers(manifest, graph)
+    snapshot_scans(directory, name, manifest, graph)
     snapshot_native_recipe_checks(directory, name, workspace, manifest, graph)
     artifacts = manifest["artifacts"]
     inventory = {}
@@ -608,7 +727,7 @@ class Phase:
         }
 
 
-def phase(path: Path, expected: set[Outputs]) -> Phase:
+def phase(path: Path, expected: set[Outputs], *, mnemonics: set[str] = COMPILER_MNEMONICS, reject_unrecorded: bool = False) -> Phase:
     entries = records(path)
     match next(entries, None):
         case {"invocation": str(invocation)} if invocation:
@@ -635,7 +754,7 @@ def phase(path: Path, expected: set[Outputs]) -> Phase:
         if status or exit_code:
             raise ValueError(f"Failed {mnemonic} spawn in {path}: {status}, exit {exit_code}")
         result.mnemonics[(mnemonic, "cache_hit" if hit else "executed")] += 1
-        if mnemonic not in COMPILER_MNEMONICS:
+        if mnemonic not in mnemonics:
             continue
         resolved = []
         for output in outputs:
@@ -646,7 +765,7 @@ def phase(path: Path, expected: set[Outputs]) -> Phase:
                     raise ValueError(f"Unresolved compiler output in {path}: {output}")
         identity = tuple(sorted(resolved))
         if identity not in expected:
-            if expected_paths.intersection(identity):
+            if reject_unrecorded or expected_paths.intersection(identity):
                 raise ValueError(f"Unknown compiler output in {path}: {identity}")
             continue
         if identity in result.executed or identity in result.cached:
@@ -656,10 +775,37 @@ def phase(path: Path, expected: set[Outputs]) -> Phase:
     return result
 
 
+def scan_measurements(directory: Path, names: tuple[str, ...]) -> tuple[dict[str, dict[Outputs, Scan]], dict[str, Phase]]:
+    inventories = {name: scan_inventory(json.loads((directory / f"{name}.scans.json").read_text())) for name in names}
+    phases = {name: phase(directory / f"{name}.execution.jsonl", set(scans), mnemonics={SCAN_MNEMONIC}, reject_unrecorded=True) for name, scans in inventories.items()}
+    first = names[0]
+    if missing := set(inventories[first]) - phases[first].executed - phases[first].cached:
+        raise ValueError(f"Baseline did not observe every compiler scan: {sorted(missing)}")
+    if inventories["unchanged"] != inventories[first]:
+        raise ValueError("Unchanged compiler scan inventory differs")
+    if phases["unchanged"].executed:
+        raise ValueError("Unchanged build executed compiler scans")
+    return inventories, phases
+
+
+def scanner_report(inventory: dict[Outputs, Scan], measured: Phase) -> dict[str, object]:
+    result = measured.report()
+    result["total_scanner_actions"] = result.pop("total_compiler_actions")
+    result["roles"] = {
+        role: {outcome: sum(measured.outcome(scan.outputs) == outcome for scan in inventory.values() if (scan.compiler["phase"] if scan.compiler else "helper") == role)
+               for outcome in ("executed", "logged_cache_hit", "absent_from_execution_log")}
+        for role in ("frontend", "single", "integrated", "helper")
+    }
+    return result
+
+
 def report(directory: Path) -> dict[str, object]:
     native_recipes = {name: read_native_recipe_checks(directory, name) for name in PHASES}
     inventories = {name: read_compilers(directory / f"{name}.compilers.json") for name in PHASES}
     compilers = inventories["baseline"]
+    scan_inventories, scan_phases = scan_measurements(directory, PHASES)
+    if any(value != scan_inventories["baseline"] for value in scan_inventories.values()):
+        raise ValueError("Compiler scan inventory changed between mutation builds")
     identities = {target: (record.source, record.outputs, {role: sorted(inputs) for role, inputs in record.generated_inputs.items()}) for target, record in compilers.items()}
     if any({target: (record.source, record.outputs, {role: sorted(inputs) for role, inputs in record.generated_inputs.items()}) for target, record in value.items()} != identities for value in inventories.values()):
         raise ValueError("Kernel compile output inventory changed between builds")
@@ -744,8 +890,27 @@ def report(directory: Path) -> dict[str, object]:
     for target in ("init/main.o", "usr/initramfs_data.o", ".vmlinux.export.c", ".vmlinux.export.o", *BOOT_HEADERS):
         if digests["incbin"][target] != digests["gzip"][target]:
             raise ValueError(f"The gzip header edit unexpectedly changed {target}")
+    scan_targets = {
+        "edited": {"init/main.o"},
+        "header": set(HEADER_TARGETS),
+        "incbin": {"usr/initramfs_data.o", PIGGY_OBJECT} | {
+            target for target, current in inventories["incbin"].items()
+            if any(inputs != inventories["header"][target].generated_inputs[role] for role, inputs in current.generated_inputs.items() if role != "backend")
+        },
+        "gzip": {PIGGY_OBJECT},
+    }
+    for name, targets in scan_targets.items():
+        allowed = {scan.outputs for scan in scan_inventories[name].values() if scan.compiler is not None and scan.compiler["target"] in targets}
+        if extra := scan_phases[name].executed - allowed:
+            raise ValueError(f"{name} edit executed unrelated compiler scans: {sorted(extra)}")
+        # Preprocessing must revisit edited source/header bytes. Binary .incbin
+        # payloads need not rerun preprocessing; the actual assembly gates above
+        # independently require the affected objects to be rebuilt.
+        if name in ("edited", "header") and (missing := allowed - scan_phases[name].executed):
+            raise ValueError(f"{name} edit did not execute affected compiler scans: {sorted(missing)}")
     return {
         "measurement_complete": True,
+        "scans": {name: scanner_report(scan_inventories[name], scan_phases[name]) for name in PHASES},
         "native_recipe_checks": native_recipes,
         "compile_inventory_unchanged": True,
         "qualification": {

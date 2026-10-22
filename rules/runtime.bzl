@@ -50,7 +50,7 @@ def context(tctx, roots, tools, params, planning = False, recorded = None, kerne
         return struct(values = values, add_all = add_all, add = add)
 
     # buildifier: disable=unused-variable
-    def run(executable, outputs, inputs = [], arguments = [], tools = [], env = None, **kwargs):
+    def run(executable, outputs, inputs = [], arguments = [], tools = [], env = None, input_aliases = {}, empty_directories = [], **kwargs):
         compiler = kwargs.get("compiler")
         if kwargs.get("mnemonic") in ["KbuildCC", "KbuildAS", "KbuildHostCC", "KbuildLLVMBackend"] and compiler == None:
             fail("Native compiler action requires explicit compiler identity: " + kwargs["mnemonic"])
@@ -72,7 +72,7 @@ def context(tctx, roots, tools, params, planning = False, recorded = None, kerne
                 message = kwargs.get("progress_message", "Compile native LLVM IR"),
             ))
             return
-        all_files = files + [x for x in tools if type(x) == "File"] + runtime_tools["compiler_files"].to_list()
+        all_files = files + input_aliases.values() + [x for x in tools if type(x) == "File"] + runtime_tools["compiler_files"].to_list()
         if type(executable) == "File":
             all_files.append(executable)
             executable = executable.path
@@ -87,10 +87,15 @@ def context(tctx, roots, tools, params, planning = False, recorded = None, kerne
             environment = environment,
             path_environment = runtime_tools.get("path_environment", {}),
             tool_runfiles = {tool.executable.path + ".runfiles": True for tool in action_tools(runtime_tools) if tool.runfiles_manifest != None}.keys(),
+            aliases = {path: file.path for path, file in input_aliases.items()},
+            empty_directories = empty_directories,
         )
         if recorded != None:
-            spec["inputs"] = [path for path in spec["inputs"] if path not in common_paths] + [common_manifest.path]
+            alias_files = {file.path: True for file in input_aliases.values()}
+            spec["inputs"] = [path for path in spec["inputs"] if path not in common_paths or path in alias_files] + [common_manifest.path]
             spec["common_inputs"] = common_manifest.path
+        else:
+            spec["inputs"].extend(input_aliases.keys())
         manifest = tctx.declare_file("actions/%d.json" % len(sequence), directory = roots["kernel"])
         tctx.write(manifest, json.encode(spec))
         if recorded != None:

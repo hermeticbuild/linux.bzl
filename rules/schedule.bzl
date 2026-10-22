@@ -75,6 +75,63 @@ def _available(input_directories, tools, additional_inputs, params):
 def _is_backend(job):
     return job.get("compiler", {}).get("phase") == "backend"
 
+def _scan_metadata(expanded, prefix):
+    """Index per-job chunks without decoding or retaining every dependency list."""
+    paths, jobs = [], {}
+    for file in expanded.children:
+        if "=" not in file.basename:
+            continue
+        relative = file.path.removeprefix(prefix + "/")
+        if relative.startswith("paths/"):
+            paths.append(file)
+        elif relative.startswith("jobs/"):
+            identity = relative.split("/", 2)[1]
+            jobs.setdefault(identity, []).append(file)
+        else:
+            fail("Unknown dependency metadata path: " + file.path)
+    return struct(paths = read_payload(struct(children = paths)), jobs = jobs)
+
+def _scan_dependencies(metadata, identity):
+    value = read_payload(struct(children = metadata.jobs[identity]))
+    result = {}
+    for kind in ["sources", "generated"]:
+        indices = value[kind]
+        if any([type(index) != "int" or index < 0 or index >= len(metadata.paths) for index in indices]):
+            fail("Compiler dependency index is outside its path table")
+        result[kind] = [metadata.paths[index] for index in indices]
+    return result
+
+def _scan_inputs(job, available, source_files, source_prefix, original_prefix):
+    """Separate candidate contents from the mandatory compiler namespace."""
+    scan = job["scan"]
+    generated = scan.get("generated", {})
+    mandatory = {path: True for path in scan.get("mandatory", [])}
+    header_tree = scan.get("header_tree")
+    narrowed = _compiler_inputs(job, dict(sources = [], generated = []), available, {}, {}, source_prefix)
+
+    def prepared(file):
+        if file.path.startswith(original_prefix + "/"):
+            return source_files[file.path.removeprefix(original_prefix + "/")]
+        return file
+
+    candidates = {}
+    inputs = {file.path: prepared(file) for file in narrowed.inputs}
+    aliases = {path: inputs[actual].path for path, actual in narrowed.aliases.items()}
+    aliases.update({source_prefix: source_prefix, original_prefix: source_prefix})
+    for path in generated.values():
+        file = prepared(available[path])
+        aliases[path] = file.path
+        if path not in mandatory:
+            if file.is_directory:
+                fail("Compiler discovery requires individual generated Files: " + path)
+            candidates[file.path] = file
+    if header_tree != None:
+        for logical, path in generated.items():
+            if not logical or logical == "." or logical.startswith("/") or ".." in logical.split("/"):
+                fail("Generated compiler input escapes its header tree: " + logical)
+            aliases[header_tree + "/" + logical] = prepared(available[path]).path
+    return struct(inputs = inputs.values(), candidates = candidates.values(), aliases = aliases, directories = narrowed.empty_directories)
+
 def _compiler_inputs(job, dependencies, available, source_files, originals, source_prefix):
     """Replace the scan's generated closure with measured and mandatory Files."""
     scan = job["scan"]
@@ -82,8 +139,8 @@ def _compiler_inputs(job, dependencies, available, source_files, originals, sour
     header_tree = scan.get("header_tree")
     mandatory = scan.get("mandatory", [])
     if header_tree != None:
-        if header_tree not in job["inputs"] or "generated" not in scan or "mandatory" not in scan or "directories" not in scan:
-            fail("Compiler header tree requires its complete generated mapping and mandatory inputs")
+        if "generated" not in scan or "mandatory" not in scan or "directories" not in scan:
+            fail("Compiler header namespace requires its complete generated mapping and mandatory inputs")
         if any([path not in job["inputs"] for path in generated.values()]):
             fail("Compiler generated mapping contains a File outside the scan input closure")
     elif generated or mandatory:
@@ -140,11 +197,7 @@ def _stage(tctx, input_directories, output_directories, tools, additional_inputs
     available = _available(input_directories, tools, additional_inputs, params)
     source_files = {f.path.removeprefix(params["source_prefix"] + "/"): f for f in input_directories["sources"].children}
     originals = {f.path.removeprefix(params["original_prefix"] + "/"): f for f in additional_inputs["originals"].to_list()}
-    scanned = {}
-    for name in input_directories:
-        if name.startswith("scan_"):
-            scanned.update(read_payload(input_directories[name]))
-    requests = []
+    scanned = _scan_metadata(input_directories["scans"], params["scan_prefix"]) if "scans" in input_directories else struct(paths = [], jobs = {})
     produced = {path: True for job in jobs for path in job["outputs"]}
     unknown = {path: True for job in jobs for path in job["inputs"] if path not in available and path not in produced}
     if unknown:
@@ -157,21 +210,16 @@ def _stage(tctx, input_directories, output_directories, tools, additional_inputs
         if any([path not in available for path in job["inputs"]]):
             continue
         aliases = {path: available[path].path for path in job["inputs"]}
-        if job["scan"] != None and str(index) not in scanned:
-            requests.append(dict(
-                id = str(index),
-                manifest = job["manifest"],
-                aliases = aliases,
-                scan = job["scan"],
-                source_prefix = params["source_prefix"],
-                original_prefix = params["original_prefix"],
-            ))
+        if job["scan"] != None and str(index) not in scanned.jobs:
+            selected = _scan_inputs(job, available, source_files, params["source_prefix"], params["original_prefix"])
+            request = tctx.declare_file("scan-requests/%d.json" % index, directory = output_directories["stage"])
+            tctx.write(request, json.encode(dict(manifest = job["manifest"], scan = job["scan"], aliases = selected.aliases, empty_directories = selected.directories, source_prefix = params["source_prefix"], original_prefix = params["original_prefix"])))
             continue
         inputs = [available[path] for path in job["inputs"]]
         source_inputs = []
         empty_directories = []
         if job["scan"] != None:
-            narrowed = _compiler_inputs(job, scanned[str(index)], available, source_files, originals, params["source_prefix"])
+            narrowed = _compiler_inputs(job, _scan_dependencies(scanned, str(index)), available, source_files, originals, params["source_prefix"])
             inputs = narrowed.inputs
             source_inputs = narrowed.source_inputs
             aliases = narrowed.aliases
@@ -195,8 +243,32 @@ def _stage(tctx, input_directories, output_directories, tools, additional_inputs
             progress_message = job["message"],
         )
         available.update({path: f for path, f in zip(job["outputs"], output_files)})
-    requests_file = tctx.declare_file("scan-requests.json", directory = output_directories["stage"])
-    tctx.write(requests_file, json.encode(requests))
+
+# Fixed map_directory callback signature.
+# buildifier: disable=unused-variable
+def _scan(tctx, input_directories, output_directories, tools, additional_inputs, additional_params):
+    params = additional_params
+    available = _available(input_directories, tools, additional_inputs, params)
+    source_files = {f.path.removeprefix(params["source_prefix"] + "/"): f for f in input_directories["sources"].children}
+    source_candidates = depset(input_directories["sources"].children)
+    requests = {file.basename.removesuffix(".json"): file for file in input_directories[params["request_directory"]].children if file.path.startswith(params["request_prefix"] + "/scan-requests/")}
+    for index, job in enumerate(_read_schedule(input_directories["schedule"])):
+        if str(index) not in requests:
+            continue
+        selected = _scan_inputs(job, available, source_files, params["source_prefix"], params["original_prefix"])
+        request = requests[str(index)]
+        dependencies = tctx.declare_file("%d/dependencies.json" % index, directory = output_directories["scans"])
+        used = tctx.declare_file("%d/used-inputs" % index, directory = output_directories["scans"])
+        tctx.run(
+            executable = tools["python"],
+            arguments = [tools["runner"].path, "scan", request.path, dependencies.path, used.path],
+            inputs = depset(selected.inputs + [request, available[job["manifest"]], tools["runner"], tools["executor"], tools["payload"]], transitive = [tools["compiler_files"], tools["execution_files"]]),
+            discovery_inputs = depset(selected.candidates, transitive = [source_candidates]),
+            used_inputs_list = used,
+            outputs = [dependencies, used],
+            tools = action_tools(tools),
+            progress_message = "Discover dependencies: " + job["message"],
+        )
 
 # Fixed map_directory callback signature.
 # buildifier: disable=unused-variable
@@ -247,9 +319,30 @@ def _export(tctx, input_directories, output_directories, tools, additional_input
     missing = [path for job in jobs for path in job["outputs"] if path not in available]
     if missing:
         fail("Kernel dependency scheduling did not converge; missing outputs: " + str(missing[:20]))
+    scans = {}
+    for name, root in json.decode(additional_params["scan_outputs"]).items():
+        for file in input_directories[name].children:
+            identity, _, kind = file.path.removeprefix(root + "/").partition("/")
+            if kind not in ["dependencies.json", "used-inputs"] or not identity.isdigit():
+                fail("Unexpected compiler scan output: " + file.path)
+            outputs = scans.setdefault(identity, {})
+            if kind in outputs:
+                fail("Compiler job was scanned more than once: " + identity)
+            outputs[kind] = file.path
+    expected = {str(index): job for index, job in enumerate(jobs) if job["scan"] != None}
+    if sorted(scans) != sorted(expected) or any([sorted(outputs) != ["dependencies.json", "used-inputs"] for outputs in scans.values()]):
+        fail("Compiler dependency scan inventory differs from the scheduled jobs")
+    compiler_scans = [dict(
+        compiler = dict(
+            {name: job["compiler"][name] for name in ["phase", "target", "kind"]},
+            source = available[job["compiler"]["source"]].path,
+        ) if job["compiler"] else {},
+        compiler_outputs = [available[path].path for path in job["outputs"]],
+        outputs = [scans[identity][kind] for kind in ["dependencies.json", "used-inputs"]],
+    ) for identity, job in expected.items()]
     prefix = additional_params["plan_prefix"] + "/"
     mappings = tctx.declare_file("scheduled-paths.json", directory = output_directories["kernel"])
-    tctx.write(mappings, json.encode(dict(paths = {path: file.path for path, file in available.items()}, compiler_jobs = [job for job in jobs if job.get("compiler")])))
+    tctx.write(mappings, json.encode(dict(paths = {path: file.path for path, file in available.items()}, compiler_jobs = [job for job in jobs if job.get("compiler")], compiler_scans = compiler_scans)))
     for path, file in available.items():
         if not path.startswith(prefix):
             continue
@@ -268,31 +361,44 @@ def _export(tctx, input_directories, output_directories, tools, additional_input
 def schedule(ctx, literals, metadata, sources, originals, original_prefix, tools, compiler_files, execution_files, backend_files, backend_tools, backend_environment, config, steps = 32):
     directories = {"literals": literals, "schedule": metadata, "sources": sources, "config": config}
     prefixes = {}
+    scan_directories, scan_outputs = {}, {}
+    previous_scans = None
     parameters = dict(plan_prefix = literals.path, source_prefix = sources.path, original_prefix = original_prefix, stage_prefixes = "{}", backend_environment = json.encode(backend_environment))
     tool_files = dict(tools, source_root = sources, config_root = config, compiler_files = compiler_files, execution_files = execution_files, backend_files = backend_files)
     tool_files.update({"backend_tool_%d" % index: tool for index, tool in enumerate(backend_tools)})
     for step in range(steps):
         stage = ctx.actions.declare_directory(ctx.label.name + ".stage%d" % step)
         ctx.actions.map_directory(
-            input_directories = dict(directories),
+            input_directories = dict(directories, **({"scans": previous_scans} if previous_scans != None else {})),
             output_directories = {"stage": stage},
             additional_inputs = {"originals": originals},
             tools = tool_files,
-            additional_params = dict(parameters, stage_prefixes = json.encode(prefixes)),
+            additional_params = dict(parameters, stage_prefixes = json.encode(prefixes), scan_prefix = previous_scans.path if previous_scans != None else ""),
             implementation = _stage,
             mnemonic = "KernelArtifact",
         )
-        scans = ctx.actions.declare_directory(ctx.label.name + ".dependencies%d" % step)
-        ctx.actions.run(
-            executable = tools["python"],
-            arguments = [tools["runner"].path, "scan", stage.path + "/scan-requests.json", scans.path],
-            inputs = depset([stage, tools["runner"], tools["executor"], tools["payload"]] + directories.values(), transitive = [originals, compiler_files, execution_files]),
-            outputs = [scans],
-            tools = action_tools(tools),
-            mnemonic = "KernelDependencyScan",
-        )
         directories["stage_%d" % step] = stage
         prefixes["stage_%d" % step] = stage.path
+        scans = ctx.actions.declare_directory(ctx.label.name + ".scans%d" % step)
+        ctx.actions.map_directory(
+            input_directories = dict(directories),
+            output_directories = {"scans": scans},
+            additional_inputs = {"originals": originals},
+            tools = tool_files,
+            additional_params = dict(parameters, stage_prefixes = json.encode(prefixes), request_directory = "stage_%d" % step, request_prefix = stage.path),
+            implementation = _scan,
+            mnemonic = "KernelDependencyScan",
+        )
+        scan_directories["scan_outputs_%d" % step] = scans
+        scan_outputs["scan_outputs_%d" % step] = scans.path
+        previous_scans = ctx.actions.declare_directory(ctx.label.name + ".dependencies%d" % step)
+        ctx.actions.run(
+            executable = tools["python"],
+            arguments = [tools["runner"].path, "collect-scans", scans.path, previous_scans.path],
+            inputs = depset([scans, tools["runner"], tools["executor"], tools["payload"]], transitive = [tools["python_files"]]),
+            outputs = [previous_scans],
+            mnemonic = "KernelDependencyMetadata",
+        )
         backend = ctx.actions.declare_directory(ctx.label.name + ".backend%d" % step)
         ctx.actions.map_directory(
             input_directories = dict(directories),
@@ -307,14 +413,14 @@ def schedule(ctx, literals, metadata, sources, originals, original_prefix, tools
         )
         directories["backend_%d" % step] = backend
         prefixes["backend_%d" % step] = backend.path
-        directories["scan_%d" % step] = scans
     result = ctx.actions.declare_directory(ctx.label.name + ".tree")
+    directories.update(scan_directories)
     ctx.actions.map_directory(
         input_directories = directories,
         output_directories = {"kernel": result},
         additional_inputs = {"originals": originals},
         tools = tool_files,
-        additional_params = dict(parameters, stage_prefixes = json.encode(prefixes)),
+        additional_params = dict(parameters, stage_prefixes = json.encode(prefixes), scan_outputs = json.encode(scan_outputs)),
         implementation = _export,
         mnemonic = "KernelExport",
     )
