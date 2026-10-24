@@ -1,0 +1,35 @@
+The compressed payload is read directly by piggy.o through .incbin. Compiler
+dependency files omit that read. If the payload's contents change while its
+compressed and uncompressed sizes stay the same, mkpiggy emits unchanged
+assembly. Declare the direct Kbuild input so Bazel retains it independently
+of piggy.S.
+
+rmpiggy.o also reads realmode.relocs directly. The parent Make invocation
+orders that cooutput after the existing realmode.bin recursion, whose child
+Makefile already builds the relocation table before the binary. This keeps
+one recursive producer under parallel Make while declaring both assembler
+inputs.
+
+diff --git a/arch/x86/boot/compressed/Makefile b/arch/x86/boot/compressed/Makefile
+--- a/arch/x86/boot/compressed/Makefile
++++ b/arch/x86/boot/compressed/Makefile
+@@ -162,3 +162,6 @@
+ targets += piggy.S
+ $(obj)/piggy.S: $(obj)/vmlinux.bin.$(suffix-y) $(obj)/mkpiggy FORCE
+ 	$(call if_changed,mkpiggy)
++
++# The assembler reads the payload through .incbin in piggy.S.
++$(obj)/piggy.o: $(obj)/vmlinux.bin.$(suffix-y)
+
+diff --git a/arch/x86/realmode/Makefile b/arch/x86/realmode/Makefile
+--- a/arch/x86/realmode/Makefile
++++ b/arch/x86/realmode/Makefile
+@@ -19,4 +19,7 @@
+-$(obj)/rmpiggy.o: $(obj)/rm/realmode.bin
++$(obj)/rmpiggy.o: $(obj)/rm/realmode.bin $(obj)/rm/realmode.relocs
++
++# The recursive realmode.bin build also produces the relocation table.
++$(obj)/rm/realmode.relocs: $(obj)/rm/realmode.bin
+ 
+ $(obj)/rm/realmode.bin: FORCE
+ 	$(Q)$(MAKE) $(build)=$(obj)/rm $@

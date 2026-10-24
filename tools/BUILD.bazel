@@ -1,0 +1,25 @@
+load("@buildifier_prebuilt//:rules.bzl", "buildifier", "buildifier_test")
+
+buildifier(
+    name = "buildifier",
+    exclude_patterns = ["*/[._]*"],
+    lint_mode = "fix",
+    mode = "fix",
+)
+
+buildifier_test(
+    name = "buildifier_test",
+    exclude_patterns = ["*/[._]*"],
+    lint_mode = "warn",
+    lint_warnings = [
+        "-module-docstring",
+        "-function-docstring-args",
+        "-function-docstring",
+        "-function-docstring-header",
+        "-function-docstring-return",
+    ],
+    # This check scans the local checkout beyond its declared runfiles.
+    local = True,
+    no_sandbox = True,
+    workspace = "//:MODULE.bazel",
+)

@@ -1,0 +1,3 @@
+%token NUMBER
+%%
+expression: NUMBER;

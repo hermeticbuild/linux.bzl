@@ -2,7 +2,8 @@
 
 load("@bazel_skylib//lib:shell.bzl", "shell")
 load("@rules_python//python:defs.bzl", "py_test")
-load("//rules:kernel.bzl", "kernel_build")
+load("//rules:config.bzl", "kernel_config")
+load("//rules:kernel.bzl", "KernelBuildInfo")
 
 # Fixed Bazel transition callback signature.
 # buildifier: disable=unused-variable
@@ -10,41 +11,47 @@ def _platform_impl(settings, attr):
     return {
         "//command_line_option:platforms": str(attr.platform),
         "//command_line_option:extra_toolchains": [str(attr.cc_toolchain)],
+        "//examples:configuration": str(attr.configuration),
     }
 
 _platform = transition(
     implementation = _platform_impl,
     inputs = [],
-    outputs = ["//command_line_option:platforms", "//command_line_option:extra_toolchains"],
+    outputs = ["//command_line_option:platforms", "//command_line_option:extra_toolchains", "//examples:configuration"],
 )
 
 def _configured_impl(ctx):
-    return [DefaultInfo(files = ctx.attr.target[0][DefaultInfo].files)]
+    target = ctx.attr.target[0]
+    result = [DefaultInfo(files = target[DefaultInfo].files)]
+    if KernelBuildInfo in target:
+        result.extend([target[KernelBuildInfo], target[OutputGroupInfo]])
+    return result
 
 _configured = rule(implementation = _configured_impl, attrs = {
     "target": attr.label(mandatory = True, cfg = _platform),
     "platform": attr.label(mandatory = True),
     "cc_toolchain": attr.label(mandatory = True),
+    "configuration": attr.string(mandatory = True),
     "_allowlist_function_transition": attr.label(default = "@bazel_tools//tools/allowlists/function_transition_allowlist"),
 })
 
-def kernel_example(name, requested, platform, cc_toolchain, overrides = {}):
-    requested = dict(requested, **overrides)
-    for suffix, config_only in [("_configuration", True), ("_unconfigured", False)]:
-        kernel_build(
-            name = name + suffix,
-            config_only = config_only,
-            mode = "qualification",
-            requested = requested,
-            rounds = 0 if config_only else 64,
-            tags = ["manual"],
-        )
+def kernel_example(name, fragments, platform, cc_toolchain, requested = {}, build_target = "kernel"):
+    kernel_config(
+        name = name + "_configuration",
+        source = "//native:source",
+        fragments = fragments,
+        requested = requested,
+        pahole = "@pahole//:pahole",
+        tags = ["manual"],
+    )
+    for public, target in [(name + "_config", name + "_configuration"), (name, build_target)]:
         _configured(
-            name = name + ("_config" if config_only else ""),
-            target = ":" + name + suffix,
+            name = public,
+            target = ":" + target,
             platform = platform,
+            configuration = str(native.package_relative_label(":" + name + "_configuration")),
             cc_toolchain = cc_toolchain,
-            tags = ["manual"] if not config_only else [],
+            tags = ["manual"],
         )
 
 def example_config_test(name, config, expected):
@@ -54,14 +61,18 @@ def example_config_test(name, config, expected):
         main = "//:test_config_values.py",
         args = ["$(location " + config + ")", shell.quote(json.encode(expected))],
         data = [config],
+        tags = ["manual"],
     )
 
 def _initramfs_impl(ctx):
+    runtime = ctx.attr._python_runtime[platform_common.ToolchainInfo].py3_runtime
+    if runtime.interpreter == None:
+        fail("Example initramfs requires a declared Python interpreter")
     output = ctx.actions.declare_file(ctx.label.name + ".cpio")
     ctx.actions.run(
-        executable = ctx.attr._writer[DefaultInfo].files_to_run,
-        arguments = [ctx.file.motd.path, output.path],
-        inputs = [ctx.file.motd],
+        executable = runtime.interpreter,
+        arguments = [ctx.file._writer.path, ctx.file.motd.path, output.path],
+        inputs = depset([ctx.file._writer, ctx.file.motd, runtime.interpreter], transitive = [runtime.files]),
         outputs = [output],
         mnemonic = "ExampleInitramfs",
     )
@@ -69,5 +80,6 @@ def _initramfs_impl(ctx):
 
 example_initramfs = rule(implementation = _initramfs_impl, attrs = {
     "motd": attr.label(mandatory = True, allow_single_file = True),
-    "_writer": attr.label(default = "//examples:initramfs_writer", cfg = "exec", executable = True),
+    "_writer": attr.label(default = "//examples:initramfs.py", cfg = "exec", allow_single_file = True),
+    "_python_runtime": attr.label(default = "@rules_python//python:current_py_toolchain", cfg = "exec"),
 })

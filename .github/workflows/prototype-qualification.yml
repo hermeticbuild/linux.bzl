@@ -1,0 +1,27 @@
+name: Measured kernel qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Validation scope
+        type: choice
+        options: [native-config, syntax, native-tools, full, exporter]
+        default: native-config
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-config-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualification:
+    if: ${{ inputs.scope != 'exporter' }}
+    uses: ./.github/workflows/kernel.yml
+    with:
+      scope: ${{ inputs.scope }}
+  exporter:
+    if: ${{ inputs.scope == 'exporter' }}
+    uses: ./.github/workflows/exporter.yml

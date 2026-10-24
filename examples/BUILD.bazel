@@ -1,32 +1,38 @@
-load("@kernel_inputs//rules:qualification.bzl", "FRAGMENTS")
-load("@rules_python//python:defs.bzl", "py_binary")
+load("//rules:kernel.bzl", "kernel_build")
 load(":kernel.bzl", "example_config_test", "example_initramfs", "kernel_example")
 
 package(default_visibility = ["//visibility:public"])
 
 exports_files(["initramfs.py"])
 
-py_binary(
-    name = "initramfs_writer",
-    srcs = ["initramfs.py"],
-    main = "initramfs.py",
-)
-
 example_initramfs(
     name = "example_initramfs",
     motd = "README.md",
+)
+
+# Variants transition this label flag, keeping one action owner for native C.
+label_flag(
+    name = "configuration",
+    build_setting_default = ":x86_64_kernel_configuration",
+)
+
+kernel_build(
+    name = "kernel",
+    config = ":configuration",
+    roots = ["vmlinux"] + select({
+        "@platforms//cpu:aarch64": ["arch/arm64/boot/Image"],
+        "@platforms//cpu:x86_64": ["arch/x86/boot/bzImage"],
+    }),
+    syntax = "@kernel_syntax//:program",
+    tags = ["manual"],
 )
 
 [
     kernel_example(
         name = name,
         cc_toolchain = "@llvm//toolchain:linux_x86_64_to_linux_aarch64" if profile == "aarch64" else "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
-        overrides = FRAGMENTS[profile] if profile not in [
-            "x86_64",
-            "aarch64",
-        ] else {},
+        fragments = ["//examples/configs:aarch64.config"] if profile == "aarch64" else ["//examples/configs:x86_64.config"] + (["//examples/configs:" + profile + ".config"] if profile != "x86_64" else []),
         platform = "@llvm//platforms:linux_aarch64" if profile == "aarch64" else "@llvm//platforms:linux_x86_64",
-        requested = FRAGMENTS["aarch64"] if profile == "aarch64" else FRAGMENTS["x86_64"],
     )
     for name, profile in [
         ("x86_64_kernel", "x86_64"),
@@ -36,6 +42,29 @@ example_initramfs(
         ("aarch64_kernel", "aarch64"),
     ]
 ]
+
+# The changed-configuration control needs only the affected object and the
+# compiler diagnostic fixture; the four full variants share :kernel above.
+kernel_build(
+    name = "changed_kernel",
+    config = ":configuration",
+    required_options = {"PANIC_TIMEOUT": "37"},
+    roots = [
+        "kernel/panic.o",
+        "lib/ctype.o",
+    ],
+    syntax = "@kernel_syntax//:program",
+    tags = ["manual"],
+)
+
+kernel_example(
+    name = "x86_64_changed_kernel",
+    build_target = "changed_kernel",
+    cc_toolchain = "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
+    fragments = ["//examples/configs:x86_64.config"],
+    platform = "@llvm//platforms:linux_x86_64",
+    requested = {"PANIC_TIMEOUT": "37"},
+)
 
 filegroup(
     name = "x86_64_shared_graph_metadata",
@@ -68,7 +97,7 @@ example_config_test(
     config = ":x86_64_debug_kernel_config",
     expected = {
         "DEBUG_KERNEL": "y",
-        "LOCALVERSION": '\"-debug\"',
+        "LOCALVERSION": "-debug",
         "RANDOMIZE_BASE": "n",
     },
 )
@@ -82,7 +111,8 @@ example_config_test(
     },
 )
 
-alias(
+example_config_test(
     name = "btf_capability_test",
-    actual = "//:parity_btf_test",
+    config = ":x86_64_btf_vmlinux_config",
+    expected = {"DEBUG_INFO_BTF": "y"},
 )

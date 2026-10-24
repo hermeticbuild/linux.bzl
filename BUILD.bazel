@@ -1,228 +1,146 @@
-load("@autoconf.bzl//:autoconf.bzl", "autoconf", "compile_test")
-load("@bazel_skylib//rules/directory:subdirectory.bzl", "subdirectory")
-load("@buildifier_prebuilt//:rules.bzl", "buildifier", "buildifier_test")
-load("@kernel_inputs//rules:qualification.bzl", "FRAGMENTS")
+load("@bazel_skylib//lib:shell.bzl", "shell")
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("@rules_cc//cc/toolchains:cc_toolchain.bzl", "cc_toolchain")
-load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("//rules:compiler.bzl", "kernel_compiler")
 load("//rules:compiler_test.bzl", "action_built_compiler", "action_built_toolchain_config")
+load("//rules:config.bzl", "kernel_config")
+load("//rules:configured.bzl", "configured_report")
 load("//rules:kernel.bzl", "kernel_build")
-load("//rules:options.bzl", "kernel_bool")
-load("//rules:parity.bzl", "configured_report", "kernel_parity")
+load("//rules:validation.bzl", "execution_tool", "kernel_validation")
 
 package(default_visibility = ["//visibility:public"])
 
+bool_flag(
+    name = "validate_native_objects",
+    build_setting_default = False,
+)
+
 exports_files([
-    "repository.bzl",
+    "MODULE.bazel",
+    "llvm_toolchain_index.json",
     "test_config_values.py",
     "probe_runtime.py",
-    "compare_upstream.py",
+    "payload.py",
+    "native_recipe.py",
+    "qualification/native_recipe_check.py",
+    "qualification/ir_diagnostics.py",
+    "qualification/ir_diagnostics.c",
     "execute.py",
     "scheduler.py",
     "emit.py",
+    "compare_kbuild.py",
+    "launcher.c",
 ])
+
+alias(
+    name = "compiler",
+    actual = "//native:compiler",
+)
+
+kernel_config(
+    name = "config",
+    fragments = ["//examples/configs:minimal.config"],
+    pahole = "@pahole//:pahole",
+    source = "//native:source",
+    tags = ["manual"],
+)
+
+kernel_config(
+    name = "allno_config",
+    pahole = "@pahole//:pahole",
+    requested = {"64BIT": "y"},
+    source = "//native:source",
+    tags = ["manual"],
+)
+
+alias(
+    name = "custom_config",
+    actual = "//native:custom_config",
+)
 
 kernel_build(
     name = "kernel",
-    rounds = 64,
+    config = ":config",
+    syntax = "@kernel_syntax//:program",
+    tags = ["manual"],
 )
 
-kernel_build(
-    name = "config",
-    config_only = True,
-    rounds = 0,
+[
+    kernel_build(
+        name = name,
+        config = config,
+        roots = ["lib/ctype.o"],
+        syntax = syntax,
+        tags = ["manual"],
+    )
+    for name, config, syntax in [
+        ("native_compiler_checks", "//native:config", "@kernel_syntax//:program"),
+        ("native_compiler_checks_5_10", "//native:old_config", "@kernel_syntax_5_10//:program"),
+    ]
+]
+
+[
+    kernel_config(
+        name = name + "_config",
+        fragments = [
+            "//examples/configs:x86_64.config",
+            "//examples/configs:btf.config",
+        ],
+        pahole = "@pahole//:pahole",
+        source = source,
+        tags = ["manual"],
+    )
+    for name, source in [
+        ("native_btf_tools", "//native:source"),
+        ("native_btf_tools_5_10", "//native:source_5_10"),
+        ("native_btf_tools_6_18", "//native:source_6_18"),
+    ]
+]
+
+[
+    kernel_build(
+        name = name,
+        config = ":" + name + "_config",
+        required_options = {"DEBUG_INFO_BTF": "y"},
+        roots = ["tools/bpf/resolve_btfids/resolve_btfids"],
+        syntax = syntax,
+        tags = ["manual"],
+    )
+    for name, syntax in [
+        ("native_btf_tools", "@kernel_syntax//:program"),
+        ("native_btf_tools_5_10", "@kernel_syntax_5_10//:program"),
+        ("native_btf_tools_6_18", "@kernel_syntax_6_18//:program"),
+    ]
+]
+
+kernel_validation(
+    name = "kernel_validation",
+    kernel = ":kernel",
+    tags = ["manual"],
 )
 
-kernel_build(
-    name = "allno_config",
-    config_only = True,
-    mode = "allno",
-    rounds = 0,
+build_test(
+    name = "kernel_acceptance_test",
+    tags = ["manual"],
+    targets = [":kernel_validation"],
 )
 
-kernel_build(
+kernel_config(
     name = "debug_config",
-    config_only = True,
+    fragments = ["//examples/configs:minimal.config"],
+    pahole = "@pahole//:pahole",
     requested = {
         "DEBUG_KERNEL": "y",
         "DEBUG_INFO_DWARF5": "y",
         "DEBUG_INFO_NONE": "n",
         "PRINTK_TIME": "y",
     },
-    rounds = 0,
-)
-
-autoconf(
-    name = "custom_probes",
-    tests = {"HAVE_CUSTOM_INT128": compile_test(
-        "int f(void) { __int128 x = 0; return (int)x; }",
-        flags = ["-Werror"],
-    )},
-)
-
-kernel_build(
-    name = "custom_config",
-    config_only = True,
-    extra_records = [
-        json.encode(kernel_bool(
-            "AUTOCONF_PROTOTYPE_CUSTOM",
-            default = "HAVE_CUSTOM_INT128",
-            probe = True,
-        )),
-        json.encode(kernel_bool(
-            "AUTOCONF_PROTOTYPE_DEPENDENT",
-            default = "y",
-            depends = "AUTOCONF_PROTOTYPE_CUSTOM",
-        )),
-    ],
-    probes = ":custom_probes",
-    rounds = 0,
-)
-
-py_test(
-    name = "execute_test",
-    srcs = [
-        "execute.py",
-        "test_execute.py",
-    ],
-    main = "test_execute.py",
-)
-
-py_test(
-    name = "generation_test",
-    srcs = [
-        "renderer/export.py",
-        "renderer/programs.py",
-        "renderer/syntax.py",
-        "test_generation.py",
-    ],
-    imports = ["renderer"],
-    main = "test_generation.py",
-)
-
-config_setting(
-    name = "clang",
-    flag_values = {"@rules_cc//cc/compiler:compiler": "clang"},
-)
-
-LLVM_TOOLS = {
-    "@llvm//tools:clang": "CC",
-    "@llvm//tools:clang++": "CXX",
-    "@llvm//tools:ld.lld": "LD",
-    "@llvm//tools:llvm-ar": "AR",
-    "@llvm//tools:llvm-nm": "NM",
-    "@llvm//tools:llvm-objcopy": "OBJCOPY",
-    "@llvm//tools:llvm-objdump": "OBJDUMP",
-    "@llvm//tools:llvm-readelf": "READELF",
-    "@llvm//tools:llvm-strip": "STRIP",
-}
-
-subdirectory(
-    name = "llvm_builtin_headers",
-    parent = "@llvm//:builtin_resource_dir",
-    path = "include",
+    source = "//native:source",
     tags = ["manual"],
 )
 
-kernel_compiler(
-    name = "compiler",
-    assembler_flags = select({
-        ":clang": ["-fintegrated-as"],
-        "//conditions:default": [],
-    }),
-    builtin_headers = select({
-        ":clang": ":llvm_builtin_headers",
-        "//conditions:default": None,
-    }),
-    tools = select({
-        ":clang": LLVM_TOOLS,
-        "//conditions:default": {"@host_tools//:bin/readelf": "READELF"},
-    }),
-    visibility = ["//visibility:public"],
-)
-
-kernel_compiler(
-    name = "llvm_compiler",
-    assembler_flags = ["-fintegrated-as"],
-    builtin_headers = ":llvm_builtin_headers",
-    tags = ["manual"],
-    tools = LLVM_TOOLS,
-)
-
-kernel_build(
-    name = "llvm_config",
-    compiler = ":llvm_compiler",
-    config_only = True,
-    rounds = 0,
-    tags = ["manual"],
-)
-
-[
-    kernel_build(
-        name = "qualification_" + name,
-        config_only = True,
-        mode = "qualification",
-        requested = dict(FRAGMENTS["x86_64"].items() + FRAGMENTS[name].items()) if name != "aarch64" else FRAGMENTS[name],
-        rounds = 0,
-        tags = ["manual"] if name == "aarch64" else [],
-    )
-    for name in [
-        "x86_64",
-        "debug",
-        "lz4",
-        "btf",
-        "aarch64",
-    ]
-]
-
-py_test(
-    name = "probes_test",
-    srcs = [
-        "probe_runtime.py",
-        "test_probes.py",
-    ],
-    args = [
-        "--compiler",
-        "$(location @host_tools//:bin/gcc)",
-    ],
-    data = ["@host_tools//:bin/gcc"],
-    main = "test_probes.py",
-)
-
-[
-    kernel_parity(
-        name = "parity_report_" + name,
-        kernel = ":qualification_" + name,
-        tags = ["manual"] if name == "aarch64" else [],
-    )
-    for name in [
-        "x86_64",
-        "debug",
-        "lz4",
-        "btf",
-        "aarch64",
-    ]
-]
-
-[
-    py_test(
-        name = "parity_" + name + "_test",
-        srcs = ["test_parity.py"],
-        args = ["$(location :parity_report_" + name + ")"],
-        data = [":parity_report_" + name],
-        main = "test_parity.py",
-        tags = ["manual"],
-    )
-    for name in [
-        "x86_64",
-        "debug",
-        "lz4",
-        "btf",
-        "aarch64",
-    ]
-]
-
-# A compiler output built in this same invocation, isolated from its host toolchain.
 constraint_setting(name = "compiler_origin")
 
 constraint_value(
@@ -283,40 +201,103 @@ toolchain(
     toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
 )
 
+kernel_compiler(
+    name = "driver_compiler",
+    assembler_flags = ["-fintegrated-as"],
+    builtin_headers = "//native:llvm_builtin_headers",
+    tags = ["manual"],
+    tools = {"@llvm//tools:llvm-readelf": "READELF"},
+)
+
+kernel_config(
+    name = "action_built_config",
+    compiler = ":driver_compiler",
+    fragments = ["//examples/configs:x86_64.config"],
+    pahole = "@pahole//:pahole",
+    source = "//native:source",
+    tags = ["manual"],
+)
+
 configured_report(
     name = "action_built_report",
     platform = ":action_built_platform",
-    report = ":parity_report_x86_64",
+    report = ":action_built_config",
     tags = ["manual"],
 )
 
 py_test(
-    name = "action_built_parity_test",
-    srcs = ["test_parity.py"],
+    name = "action_built_config_test",
+    srcs = ["test_config_values.py"],
     args = [
-        "$(location :action_built_report)",
-        "--compiler-suffix",
-        "/compiler_driver",
+        "$(rootpath :action_built_report)",
+        shell.quote(json.encode({
+            "X86": "y",
+            "64BIT": "y",
+            "CC_IS_CLANG": "y",
+            "CC_HAS_AUTO_VAR_INIT_PATTERN": "n",
+        })),
+        "--compiler-suffix=/compiler_driver",
     ],
     data = [":action_built_report"],
-    main = "test_parity.py",
-    tags = ["manual"],
-)
-
-configured_report(
-    name = "arm64_report",
-    platform = "@llvm//platforms:linux_aarch64",
-    report = ":parity_report_aarch64",
+    main = "test_config_values.py",
     tags = ["manual"],
 )
 
 py_test(
-    name = "arm64_parity_test",
-    srcs = ["test_parity.py"],
-    args = ["$(location :arm64_report)"],
-    data = [":arm64_report"],
-    main = "test_parity.py",
-    tags = ["manual"],
+    name = "execute_test",
+    srcs = [
+        "execute.py",
+        "payload.py",
+        "scheduler.py",
+        "test_execute.py",
+    ],
+    main = "test_execute.py",
+)
+
+py_test(
+    name = "generation_test",
+    srcs = [
+        "renderer/catalog.py",
+        "renderer/compiler_queries.py",
+        "renderer/export.py",
+        "renderer/inputs.py",
+        "renderer/programs.py",
+        "renderer/syntax.py",
+        "renderer/text_transforms.py",
+        "test_generation.py",
+    ],
+    args = [
+        "--make",
+        "$(location //native:make_ast)",
+    ],
+    data = ["//native:make_ast"],
+    imports = ["renderer"],
+    main = "test_generation.py",
+)
+
+py_test(
+    name = "probes_test",
+    srcs = [
+        "native_recipe.py",
+        "payload.py",
+        "probe_runtime.py",
+        "test_probes.py",
+    ],
+    args = [
+        "--compiler",
+        "$(location @llvm//tools:clang)",
+        "--shell",
+        "$(location @kernel_exec_bash_linux_x86_64//file)",
+    ],
+    data = [
+        "@kernel_exec_bash_linux_x86_64//file",
+        "@llvm//tools:clang",
+    ],
+    main = "test_probes.py",
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
 )
 
 py_test(
@@ -324,39 +305,97 @@ py_test(
     srcs = [
         "check_reuse.py",
         "test_reuse.py",
-    ],
+    ] + glob(["qualification/*.py"]),
+    data = ["qualification/family_baseline.json"],
     main = "test_reuse.py",
 )
 
+py_binary(
+    name = "ir_compare",
+    srcs = [
+        "qualification/ir_compare.py",
+        "qualification/ir_reuse_report.py",
+        "qualification/reuse_report.py",
+    ],
+    main = "qualification/ir_compare.py",
+)
+
 filegroup(
-    name = "generator_sources",
+    name = "kbuild_exporter_sources",
+    srcs = glob(["renderer/*.py"]),
+)
+
+execution_tool(
+    name = "repository_test_make",
+    testonly = True,
+    tool = "@make",
+)
+
+[py_test(
+    name = name,
+    timeout = "long",
     srcs = [
         "build.py",
-        "launcher.c",
         "test_repository.py",
-    ] + glob(
-        [
-            "native/**",
-            "renderer/**",
-        ],
-        exclude = ["**/__pycache__/**"],
-    ),
+    ],
+    args = [
+        "--tool",
+        "$(location //native:exporter)",
+        "--source-anchor",
+        "$(location @%s//:Makefile)" % source,
+        "--make",
+        "$(location :repository_test_make)",
+    ],
+    data = [
+        ":repository_test_make",
+        "//native:exporter",
+        "@%s//:Makefile" % source,
+        "@%s//:sources" % source,
+    ],
+    main = "test_repository.py",
+    tags = ["manual"],
+) for name, source in [("repository_test", "linux_source")] + [
+    (
+        "repository_%s_test" % line,
+        "linux_" + line,
+    )
+    for line in [
+        "5_10",
+        "5_15",
+        "6_1",
+        "6_6",
+        "6_12",
+        "6_18",
+    ]
+]]
+
+test_suite(
+    name = "repository_tests",
+    tags = ["manual"],
+    tests = [":repository_test"] + [":repository_%s_test" % line for line in [
+        "5_10",
+        "5_15",
+        "6_1",
+        "6_6",
+        "6_12",
+        "6_18",
+    ]],
 )
 
 py_test(
     name = "prototype_test",
     srcs = [
+        "native_recipe.py",
         "prototype_test.py",
-        "renderer/export.py",
-        "renderer/repository_main.py",
+        "//examples:initramfs.py",
+        "//native:configure.py",
+        "//native:spec.py",
     ],
     args = [
-        "--initramfs",
-        "$(rootpath //examples:initramfs.py)",
         "--config-anchor",
         "$(rootpath //examples/configs:x86_64.config)",
     ],
-    data = ["//examples:initramfs.py"] + ["//examples/configs:" + name + ".config" for name in [
+    data = ["//examples/configs:" + name + ".config" for name in [
         "x86_64",
         "aarch64",
         "debug",
@@ -366,24 +405,10 @@ py_test(
     imports = ["renderer"],
 )
 
-buildifier(
-    name = "buildifier",
-    exclude_patterns = ["*/[._]*"],
-    lint_mode = "fix",
-    mode = "fix",
-)
-
-buildifier_test(
-    name = "buildifier_test",
-    exclude_patterns = ["*/[._]*"],
-    lint_mode = "warn",
-    lint_warnings = [
-        "-module-docstring",
-        "-function-docstring-args",
-        "-function-docstring",
-        "-function-docstring-header",
-        "-function-docstring-return",
-    ],
-    no_sandbox = True,
-    workspace = "//:MODULE.bazel",
+py_binary(
+    name = "bootstrap_builder",
+    srcs = ["build.py"],
+    env = {"PYTHONDONTWRITEBYTECODE": "1"},
+    main = "build.py",
+    tags = ["manual"],
 )

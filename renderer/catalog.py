@@ -81,7 +81,7 @@ def catalog(tree, linux, arch):
                     if artifact_path(token) and '/' not in token and '$' not in token:
                         hostprogs.add(token)
         # Host tools: native Makefile.host determines flags and command syntax.
-        for host in hostprogs:
+        for host in sorted(hostprogs):
             path = posixpath.normpath(directory + '/' + host)
             members = []
             dynamic = False
@@ -174,7 +174,7 @@ def catalog(tree, linux, arch):
     # This discovers modpost's empty.o and devicetable-offsets.s, as well as
     # bounds.s and asm-offsets.s, without running a configured Make at generation.
     for target, deps in list(prerequisites.items()):
-        for dep in deps:
+        for dep in sorted(deps):
             if dep.endswith(('.o', '.s')) and (linux / PurePosixPath(dep).with_suffix('.c')).is_file():
                 owner = str(PurePosixPath(dep).parent)
                 if dep in ('kernel/bounds.s', 'arch/' + arch + '/kernel/asm-offsets.s', 'kernel/sched/rq-offsets.s'):
@@ -222,7 +222,7 @@ def catalog(tree, linux, arch):
             blocked.setdefault(target, []).append('dependency cycle')
             return False
         visiting.add(target)
-        for dep in actions[target]['deps']:
+        for dep in sorted(actions[target]['deps']):
             if dep not in actions or not check(dep):
                 blocked.setdefault(target, []).append(dep)
         visiting.remove(target)

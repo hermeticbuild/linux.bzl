@@ -1,19 +1,157 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_python//python:defs.bzl", "py_test")
+load("//rules:initramfs.bzl", "initramfs")
 load("//rules:schedule_test.bzl", "schedule_fixture")
 load(":expressions_test.bzl", "probe_context_test")
+load(":native_exports_test.bzl", "native_exports_fixture")
+load(":runtime_test.bzl", "payload_test")
+load(":source_files_test.bzl", "source_files_test")
+load(":syntax_test.bzl", "probe_rounds_test", "syntax_identity_test")
 
 schedule_fixture(
     name = "scheduler",
     srcs = [
+        "direct.S",
+        "embedded.txt",
         "included.c",
         "main.c",
         "other.c",
+        "parser.y",
         "value.h",
     ],
 )
 
 probe_context_test(name = "probe_context_test")
 
+payload_test(name = "payload_test")
+
+native_exports_fixture(name = "native_exports")
+
+build_test(
+    name = "native_exports_test",
+    targets = [":native_exports"],
+)
+
+[
+    cc_library(
+        name = "zlib_headers_" + name,
+        srcs = ["zlib_headers.c"],
+        copts = [
+            "-Wundef",
+            "-Werror",
+        ],
+        local_defines = ["EXPECT_HEADERS=" + expected] + definitions,
+        tags = ["manual"],
+        deps = ["@zlib"],
+    )
+    for name, expected, definitions in [
+        ("absent", "0", []),
+        (
+            "empty",
+            "0",
+            [
+                "HAVE_UNISTD_H=",
+                "HAVE_STDARG_H=",
+            ],
+        ),
+        (
+            "zero",
+            "0",
+            [
+                "HAVE_UNISTD_H=0",
+                "HAVE_STDARG_H=0",
+            ],
+        ),
+        (
+            "one",
+            "1",
+            [
+                "HAVE_UNISTD_H=1",
+                "HAVE_STDARG_H=1",
+            ],
+        ),
+    ]
+]
+
+build_test(
+    name = "zlib_headers_test",
+    targets = [":zlib_headers_" + name for name in [
+        "absent",
+        "empty",
+        "zero",
+        "one",
+    ]],
+)
+
 exports_files([
     "compiler_driver.c",
     "generate.py",
 ])
+
+syntax_identity_test(name = "syntax_identity_test")
+
+probe_rounds_test(name = "probe_rounds_test")
+
+source_files_test(
+    name = "source_files_test",
+    anchor = "@linux_6_18//:Makefile",
+    sources = "@linux_6_18//:sources",
+)
+
+# This source normalizes regular-file timestamps as well as directory entries.
+# Its archive format is also accepted by the older guest kernels.
+cc_binary(
+    name = "gen_init_cpio",
+    srcs = ["@linux_6_18//:usr/gen_init_cpio.c"],
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+[
+    initramfs(
+        name = name,
+        exec_compatible_with = ["@platforms//os:linux"],
+        executables = {"/init": "test_initramfs.py"},
+        files = files,
+        generator = ":gen_init_cpio",
+    )
+    for name, files in [
+        (
+            "initramfs",
+            {
+                "/etc/config": "value.h",
+                "/usr/share/message": "main.c",
+            },
+        ),
+        (
+            "initramfs_reordered",
+            {
+                "/usr/share/message": "main.c",
+                "/etc/config": "value.h",
+            },
+        ),
+    ]
+]
+
+py_test(
+    name = "initramfs_test",
+    srcs = ["test_initramfs.py"],
+    args = [
+        "--archive=$(location :initramfs)",
+        "--reordered=$(location :initramfs_reordered)",
+        "--generator=$(location :gen_init_cpio)",
+        "--config=$(location value.h)",
+        "--message=$(location main.c)",
+    ],
+    data = [
+        "main.c",
+        "value.h",
+        ":gen_init_cpio",
+        ":initramfs",
+        ":initramfs_reordered",
+    ],
+    exec_compatible_with = ["@platforms//os:linux"],
+    main = "test_initramfs.py",
+    target_compatible_with = ["@platforms//os:linux"],
+)

@@ -1,0 +1,15 @@
+config NATIVE_COMMAND_LINE
+	string "Native command line"
+	default ""
+
+choice
+	prompt "Native command-line behavior" if NATIVE_COMMAND_LINE != ""
+	default NATIVE_CHOICE_DEFAULT
+
+config NATIVE_CHOICE_DEFAULT
+	bool "Use default command line"
+
+config NATIVE_CHOICE_FORCE
+	bool "Force command line"
+
+endchoice

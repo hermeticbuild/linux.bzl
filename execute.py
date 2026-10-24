@@ -27,6 +27,11 @@ def execute(spec, scanner=None):
     with tempfile.TemporaryDirectory(prefix='kernel-action-') as temporary:
         work = Path(temporary)
         directories = set(spec['directory_inputs'])
+        for name in spec.get('empty_directories', []):
+            path = Path(name)
+            if path.is_absolute() or '..' in path.parts:
+                raise ValueError('Invalid empty input directory: ' + name)
+            (work / path).mkdir(parents=True, exist_ok=True)
         for name in sorted(set(spec['inputs']), key=lambda path: (len(Path(path).parts), path)):
             path = Path(name)
             if path.is_absolute():
@@ -42,13 +47,27 @@ def execute(spec, scanner=None):
                     archive.extractall(dest, filter='data')
             else:
                 dest.symlink_to(source)
+        # FilesToRunProvider creates these namespaces on the outer Bazel
+        # action. Keep its aliases and repository mappings in the private cwd.
+        for name in spec.get('tool_runfiles', []):
+            path = Path(name)
+            if path.is_absolute() or '..' in path.parts:
+                raise ValueError('Invalid tool runfiles directory: ' + name)
+            source = real / path
+            if not source.is_dir():
+                raise FileNotFoundError('Declared tool runfiles directory is missing: ' + name)
+            destination = work / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.symlink_to(source, target_is_directory=True)
         for name in spec['outputs']:
             (work / name).parent.mkdir(parents=True, exist_ok=True)
         executable = spec['executable']
         if not executable.startswith('/'):
             executable = str(real / executable)
         arguments = scanner(spec, work) if scanner else spec['arguments']
-        subprocess.run([executable, *arguments], cwd=work, env=spec['environment'], check=True)
+        environment = dict(spec['environment'], KBUILD_EXEC_ROOT=str(work))
+        environment.update({name: str(work / path) for name, path in spec.get('path_environment', {}).items()})
+        subprocess.run([executable, *arguments], cwd=work, env=environment, check=True)
         if scanner:
             return scanner.dependencies(work)
         for name in spec['outputs']:

@@ -1,0 +1,316 @@
+load("@autoconf.bzl//:autoconf.bzl", "autoconf", "compile_test")
+load("@bazel_skylib//lib:shell.bzl", "shell")
+load("@bazel_skylib//rules/directory:subdirectory.bzl", "subdirectory")
+load("@llvm//toolchain/args:llvm_target_triple.bzl", "LLVM_TARGET_TRIPLE")
+load("@rules_python//python:defs.bzl", "py_test")
+load("//rules:compiler.bzl", "kernel_compiler")
+load("//rules:config.bzl", "kernel_config")
+load("//rules:source.bzl", "kernel_source")
+load(":bootstrap.bzl", "make_parser", "python_input", "syntax_exporter", "syntax_exporter_archive")
+load(":make_ast.bzl", "make_ast")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(glob([
+    "*.c",
+    "*.py",
+    "*.patch",
+    "*.bazel",
+    "*.inc",
+]))
+
+make_ast(
+    name = "make_ast",
+    glob_inputs = select({
+        ":linux_aarch64_musl": ["@make//:gnu_glob_inputs"],
+        ":linux_x86_64_musl": ["@make//:gnu_glob_inputs"],
+        "//conditions:default": [],
+    }),
+    tags = ["manual"],
+    exports = [
+        "ast_export.inc",
+        "expr_export.inc",
+        "setup_export.inc",
+    ],
+)
+
+subdirectory(
+    name = "llvm_builtin_headers",
+    parent = "@llvm//:builtin_resource_dir",
+    path = "include",
+)
+
+kernel_compiler(
+    name = "compiler",
+    assembler_flags = ["-fintegrated-as"],
+    builtin_headers = ":llvm_builtin_headers",
+    target_flags = ["-target"] + LLVM_TARGET_TRIPLE,
+    tools = {
+        "@llvm//tools:clang": "CC",
+        "@llvm//tools:clang++": "CXX",
+        "@llvm//tools:ld.lld": "LD",
+        "@llvm//tools:llvm-ar": "AR",
+        "@llvm//tools:llvm-nm": "NM",
+        "@llvm//tools:llvm-objcopy": "OBJCOPY",
+        "@llvm//tools:llvm-objdump": "OBJDUMP",
+        "@llvm//tools:llvm-readelf": "READELF",
+        "@llvm//tools:llvm-strip": "STRIP",
+    },
+)
+
+[
+    kernel_source(
+        name = name,
+        anchor = "@" + repository + "//:Makefile",
+        sources = "@" + repository + "//:sources",
+    )
+    for name, repository in [
+        ("source", "linux_source"),
+        ("source_5_10", "linux_5_10"),
+        ("source_6_18", "linux_6_18"),
+    ]
+]
+
+[
+    kernel_config(
+        name = name,
+        fragments = ["//examples/configs:x86_64.config"] + (["//examples/configs:lz4.config"] if lz4 else []),
+        pahole = "@pahole//:pahole",
+        source = source,
+        tags = ["manual"],
+    )
+    for name, source, lz4 in [
+        ("config", ":source", False),
+        ("lz4_config", ":source", True),
+        ("old_config", ":source_5_10", False),
+    ]
+]
+
+autoconf(
+    name = "custom_probes",
+    tests = {"HAVE_CUSTOM_INT128": compile_test(
+        "int f(void) { __int128 x = 0; return (int)x; }",
+        flags = ["-Werror"],
+    )},
+)
+
+kernel_config(
+    name = "custom_config",
+    kconfig_extension = "custom.Kconfig",
+    pahole = "@pahole//:pahole",
+    probes = ":custom_probes",
+    source = ":source",
+    tags = ["manual"],
+)
+
+kernel_config(
+    name = "old_override_config",
+    pahole = "@pahole//:pahole",
+    requested = {"EMBEDDED": "n"},
+    source = ":source_5_10",
+    tags = ["manual"],
+)
+
+[
+    kernel_config(
+        name = name,
+        kconfig_extension = "choice.Kconfig",
+        mode = mode,
+        pahole = "@pahole//:pahole",
+        requested = requested,
+        # This source gates choice members on the parent prompt. Newer native
+        # Kconfig permits an explicitly selected member under a hidden prompt.
+        source = ":source_5_10",
+        tags = ["manual"],
+    )
+    for name, mode, requested in [
+        (
+            "hidden_choice_config",
+            "allnoconfig",
+            {"NATIVE_CHOICE_FORCE": "y"},
+        ),
+        (
+            "visible_choice_config",
+            "olddefconfig",
+            {"NATIVE_COMMAND_LINE": '"console=ttyS0"'},
+        ),
+    ]
+]
+
+[
+    py_test(
+        name = name + "_test",
+        srcs = ["//:test_config_values.py"],
+        args = [
+            "$(rootpath :" + name + ")",
+            shell.quote(json.encode(expected)),
+        ] + extra,
+        data = [":" + name],
+        main = "//:test_config_values.py",
+        tags = ["manual"],
+    )
+    for name, expected, extra in [
+        (
+            "config",
+            {
+                "X86": "y",
+                "64BIT": "y",
+                "KERNEL_GZIP": "y",
+            },
+            ["--make-string=CC_VERSION_TEXT=raw"],
+        ),
+        (
+            "lz4_config",
+            {
+                "KERNEL_LZ4": "y",
+                "KERNEL_GZIP": "n",
+            },
+            [],
+        ),
+        (
+            "old_config",
+            {
+                "EMBEDDED": "y",
+                "EXPERT": "y",
+            },
+            [
+                "--unwritten=DEFCONFIG_LIST",
+                "--type=DEFCONFIG_LIST=string",
+                "--make-string=CC_VERSION_TEXT=quoted",
+            ],
+        ),
+        (
+            "old_override_config",
+            {
+                "EMBEDDED": "n",
+                "EXPERT": "n",
+            },
+            [],
+        ),
+        (
+            "custom_config",
+            {
+                "HAVE_CUSTOM_INT128": "y",
+                "AUTOCONF_PROTOTYPE_CUSTOM": "y",
+                "AUTOCONF_PROTOTYPE_DEPENDENT": "y",
+            },
+            [],
+        ),
+        (
+            "hidden_choice_config",
+            {
+                "NATIVE_CHOICE_FORCE": "n",
+                "NATIVE_CHOICE_DEFAULT": "n",
+            },
+            [
+                "--unwritten=NATIVE_CHOICE_FORCE",
+                "--unwritten=NATIVE_CHOICE_DEFAULT",
+            ],
+        ),
+        (
+            "visible_choice_config",
+            {
+                "NATIVE_CHOICE_DEFAULT": "y",
+                "NATIVE_CHOICE_FORCE": "n",
+            },
+            [],
+        ),
+    ]
+]
+
+test_suite(
+    name = "config_tests",
+    tags = ["manual"],
+    tests = [":" + name + "_test" for name in [
+        "config",
+        "lz4_config",
+        "old_config",
+        "old_override_config",
+        "custom_config",
+        "hidden_choice_config",
+        "visible_choice_config",
+    ]],
+)
+
+config_setting(
+    name = "linux_aarch64_musl",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:aarch64",
+        "@llvm//constraints/libc:musl",
+    ],
+)
+
+config_setting(
+    name = "linux_x86_64_musl",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+        "@llvm//constraints/libc:musl",
+    ],
+)
+
+config_setting(
+    name = "macos_aarch64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+config_setting(
+    name = "macos_x86_64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+make_parser(
+    name = "make_parser",
+    tags = ["manual"],
+)
+
+syntax_exporter(
+    name = "exporter",
+    license_files = ["@make_ast_sources//:COPYING"] + select({
+        ":linux_aarch64_musl": ["@bootstrap_python_linux_aarch64//:licenses"],
+        ":linux_x86_64_musl": ["@bootstrap_python//:licenses"],
+        ":macos_aarch64": ["@bootstrap_python_macos//:licenses"],
+        ":macos_x86_64": ["@bootstrap_python_macos_x86_64//:licenses"],
+    }),
+    make = ":make_parser",
+    python = python_input("runtime"),
+    python_metadata = python_input("PYTHON.json"),
+    renderer = ["//:kbuild_exporter_sources"],
+    stdlib = python_input("stdlib"),
+    tags = ["manual"],
+)
+
+syntax_exporter_archive(
+    name = "exporter_archive",
+    exporter = ":exporter",
+    tags = ["manual"],
+)
+
+# Static-musl artifacts execute on the ordinary Linux host of the same CPU.
+[
+    toolchain(
+        name = name,
+        exec_compatible_with = [
+            "@platforms//os:linux",
+            "@platforms//cpu:" + cpu,
+        ],
+        target_compatible_with = [
+            "@platforms//os:linux",
+            "@platforms//cpu:" + cpu,
+            "@llvm//constraints/libc:musl",
+        ],
+        toolchain = "@bazel_tools//tools/test:empty_toolchain",
+        toolchain_type = "@bazel_tools//tools/test:default_test_toolchain_type",
+    )
+    for name, cpu in [
+        ("static_musl_tests", "x86_64"),
+        ("static_musl_aarch64_tests", "aarch64"),
+    ]
+]

@@ -3,8 +3,7 @@ def execution_tools(ctx):
 
 def run_recipe(ctx, execution, command, arguments = [], tools = [], **kwargs):
     env = {"LC_ALL": "C", "LANG": "C", "TZ": "UTC", "PYTHONNOUSERSITE": "1"}
-    env.update(execution.environment)
-    env.update(kwargs.pop("env", {}))
+    env.update(kwargs.pop("env", execution.environment))
     prefix = 'set -eu\nexport KBUILD_EXEC_ROOT="$PWD"\nexport PATH="$PWD/%s%s"\nexport CONFIG_SHELL="$PWD/%s"\nexport TMPDIR="$PWD"\n' % (execution.bin_dir, "${PATH:+:$PATH}" if "PATH" in env else "", execution.shell.path)
     ctx.actions.run(
         executable = execution.shell,

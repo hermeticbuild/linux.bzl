@@ -1,0 +1,99 @@
+{
+  "provenance": {
+    "measurement": {
+      "run": "https://github.com/hermeticbuild/linux.bzl/actions/runs/40025644982",
+      "source": "fa9c361e60236eee8ca8cb803c955b83c3e069d2",
+      "artifact_id": 12542886475,
+      "archive_sha256": "1414c1c84e4e4e78f1f5c34a232b7ec29c4146820911c99316581b4b5666a7fa",
+      "report_sha256": "b0c9c94dca196ebe47311f8ca26703d9811240970841a4318bb90166cbd85367",
+      "scope": "All six captures, native parity and reuse controls passed. The four product configurations recorded 8,164 compiler roles and 7,786 distinct REAPI keys. LZ4, debug and BTF retrieved 187, 184 and 7 earlier-matching backend keys from disk, respectively, after fresh base execution. Matching multiple predecessors does not identify which one populated the cache.",
+      "members": [
+        "linux.bzl/linux.bzl/validation/family/ir-reuse.json",
+        "linux.bzl/linux.bzl/validation/family/base.execution.jsonl",
+        "linux.bzl/linux.bzl/validation/family/base.ir.json",
+        "linux.bzl/linux.bzl/validation/family/lz4.execution.jsonl",
+        "linux.bzl/linux.bzl/validation/family/lz4.ir.json",
+        "linux.bzl/linux.bzl/validation/family/debug.execution.jsonl",
+        "linux.bzl/linux.bzl/validation/family/debug.ir.json",
+        "linux.bzl/linux.bzl/validation/family/btf.execution.jsonl",
+        "linux.bzl/linux.bzl/validation/family/btf.ir.json"
+      ]
+    },
+    "inputs": {
+      "linux_commit": "0fcb05b72344f40806cbe810de8872f1698bf053",
+      "llvm": "23.1.2-ir1",
+      "bazel": "10.0.0-bb0242a676",
+      "exporter_source": "3ebc87c59c178d1a3998763a70ce8e1a588534c7"
+    },
+    "scope": "Root-reachable native compiler roles; integrated reference and diagnostic work are excluded. Repeated keys describe sharing, not cache retrieval. Update deliberately with source/config/tool changes."
+  },
+  "variants": {
+    "base": {
+      "compiler_counts": {
+        "c": 975,
+        "assembly": 45,
+        "host": 18,
+        "codegen": 4
+      },
+      "product_compiler_actions": 2017,
+      "config_sha256": "6a2cb853daf9f558b6cc1c496f8a3499664c147da4e24c2aeac468c488b9c977",
+      "compiler_inventory_sha256": "f11b9136bcb31fd7faf70de7e6b2ea03b1c2bac494595c1374d4a3ad6e9ab5d8"
+    },
+    "debug": {
+      "compiler_counts": {
+        "c": 973,
+        "assembly": 45,
+        "host": 18,
+        "codegen": 4
+      },
+      "product_compiler_actions": 2013,
+      "config_sha256": "7e54f18fa7a96605ef3019fd5fd168a3c89e1f6a868c08ffa112e963b7d68675",
+      "compiler_inventory_sha256": "ddae4271f941e7b6eee4e7f8ed92eec225d99ba9d852d26caa0671c209a8014e"
+    },
+    "btf": {
+      "compiler_counts": {
+        "c": 1025,
+        "assembly": 45,
+        "host": 18,
+        "codegen": 4
+      },
+      "product_compiler_actions": 2117,
+      "config_sha256": "4a486c0b4e3594472d5739a977661cc9df1d5b18882b4e660594ca16a659b1c7",
+      "compiler_inventory_sha256": "339b1cddc66e075b4715af81d8816df0c715b7f73d70d3a0b132a501ee15cd4c"
+    },
+    "lz4": {
+      "compiler_counts": {
+        "c": 975,
+        "assembly": 45,
+        "host": 18,
+        "codegen": 4
+      },
+      "product_compiler_actions": 2017,
+      "config_sha256": "4bc263cec38574f77f8a2c4351591a301e3b174852ab7acdca6974d86642d77e",
+      "compiler_inventory_sha256": "f11b9136bcb31fd7faf70de7e6b2ea03b1c2bac494595c1374d4a3ad6e9ab5d8"
+    }
+  },
+  "aggregate": {
+    "product_compiler_instances": 8164,
+    "distinct_product_compiler_action_keys": 7786,
+    "repeated_backend_instances": 378
+  },
+  "backend_memberships": {
+    "base/debug": 184,
+    "base/btf": 7,
+    "base/lz4": 187,
+    "debug/btf": 6,
+    "debug/lz4": 184,
+    "btf/lz4": 7,
+    "base/debug/btf": 6,
+    "base/debug/lz4": 184,
+    "base/btf/lz4": 7,
+    "debug/btf/lz4": 6,
+    "base/debug/btf/lz4": 6
+  },
+  "backend_retrievals": {
+    "lz4": 187,
+    "debug": 184,
+    "btf": 7
+  }
+}

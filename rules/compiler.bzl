@@ -6,7 +6,7 @@ load("@rules_cc//cc:action_names.bzl", "ACTION_NAMES")
 load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cc_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 
-KernelCompilerInfo = provider("Selected compiler commands and their artifact closure.", fields = ["context", "roles", "files", "tools", "builtin_include", "assembler_flags"])
+KernelCompilerInfo = provider("Selected compiler commands and their artifact closure.", fields = ["context", "roles", "files", "tools", "builtin_include", "target_flags", "assembler_flags"])
 
 def _impl(ctx):
     tc = toolchain_context(ctx)
@@ -47,10 +47,11 @@ def _impl(ctx):
     closure = depset(transitive = files).to_list()
     directories = [f.path + "/" for f in closure if f.is_directory]
     closure = depset([f for f in closure if not any([f.path.startswith(prefix) for prefix in directories])])
-    return [KernelCompilerInfo(context = tc, roles = roles, files = closure, tools = tools, builtin_include = builtin, assembler_flags = ctx.attr.assembler_flags)]
+    return [KernelCompilerInfo(context = tc, roles = roles, files = closure, tools = tools, builtin_include = builtin, target_flags = ctx.attr.target_flags, assembler_flags = ctx.attr.assembler_flags)]
 
 kernel_compiler = rule(implementation = _impl, fragments = ["cpp"], toolchains = use_cc_toolchain(), attrs = {
     "tools": attr.label_keyed_string_dict(cfg = "exec", allow_files = True),
+    "target_flags": attr.string_list(doc = "Compiler target selection, preceding source-owned Kbuild flags."),
     "assembler_flags": attr.string_list(),
     "builtin_headers": attr.label(cfg = "exec", providers = [DirectoryInfo]),
 })
