@@ -603,6 +603,9 @@ func safeProbeOperand(option, operand string) bool {
 	case "--param":
 		return regexp.MustCompile(`^[A-Za-z0-9_-]+=[A-Za-z0-9_-]+$`).MatchString(operand)
 	case "-mllvm":
+		if strings.HasPrefix(operand, "-max-store-memset=") {
+			return true
+		}
 		switch operand {
 		case "-asan-kernel-mem-intrinsic-prefix=1", "-msan-disable-checks=1", "-tsan-compound-read-before-write=1", "-tsan-distinguish-volatile=1":
 			return true

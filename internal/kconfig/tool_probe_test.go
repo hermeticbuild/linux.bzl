@@ -101,22 +101,37 @@ func TestLinuxProbeShellWithToolsAcceptsWindowsSuffixedToolPaths(t *testing.T) {
 }
 
 func TestLinuxToolProbeRunsAndCachesRealCompilerProbe(t *testing.T) {
-	probe, counter := testRealToolProbe(t, "armv7")
-	for i := 0; i < 2; i++ {
-		supported, err := probe.SupportsOption(context.Background(), "cc_option", []string{"-fno-stack-protector"}, nil)
-		if err != nil || !supported {
-			t.Fatalf("SupportsOption() = %v, %v", supported, err)
-		}
-	}
-	data, err := os.ReadFile(counter)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "x" {
-		t.Fatalf("tool executed %d times, want one cached execution", len(data))
-	}
-	if !strings.HasPrefix(probe.Identity(), "sha256-") {
-		t.Fatalf("identity = %q", probe.Identity())
+	for _, test := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "compiler option", args: []string{"-fno-stack-protector"}, want: true},
+		{name: "LLVM option", args: []string{"-mllvm", "-asan-kernel-mem-intrinsic-prefix=1"}, want: true},
+		{name: "inline memset", args: []string{"-mllvm", "-max-store-memset=4294967294"}, want: true},
+		{name: "different threshold", args: []string{"-mllvm", "-max-store-memset=32"}, want: true},
+		{name: "value delegated to compiler", args: []string{"-mllvm", "-max-store-memset=not-a-number"}, want: true},
+		{name: "compiler rejection", args: []string{"-fnot-supported"}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			probe, counter := testRealToolProbe(t, "armv7")
+			for i := 0; i < 2; i++ {
+				got, err := probe.SupportsOption(context.Background(), "cc_option", test.args, nil)
+				if err != nil || got != test.want {
+					t.Fatalf("SupportsOption(%q) = %v, %v; want %v, nil", test.args, got, err, test.want)
+				}
+			}
+			data, err := os.ReadFile(counter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != "x" {
+				t.Fatalf("tool executed %d times, want one cached execution", len(data))
+			}
+			if !strings.HasPrefix(probe.Identity(), "sha256-") {
+				t.Fatalf("identity = %q", probe.Identity())
+			}
+		})
 	}
 }
 
@@ -331,6 +346,8 @@ func TestLinuxToolProbeFailsClosedBeforeExecution(t *testing.T) {
 		{"-DOK=1\n-fplugin=bad"},
 		{"-fplugin=/tmp/evil.so"},
 		{"-mllvm", "-load=/tmp/evil.so"},
+		{"-mllvm", "-load=evil.so"},
+		{"-mllvm", "-max-store-memset-other=32"},
 		{"--script=/tmp/evil.ld"},
 		{"--plugin=/tmp/evil.so"},
 		{"-Map=/tmp/owned"},
